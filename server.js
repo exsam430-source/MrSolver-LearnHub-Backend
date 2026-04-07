@@ -1,6 +1,5 @@
 import dotenv from 'dotenv';
-dotenv.config();  
-
+dotenv.config();
 
 import express from 'express';
 import cors from 'cors';
@@ -29,8 +28,6 @@ import siteRoutes from './routes/siteRoutes.js';
 import certificateRoutes from './routes/certificateRoutes.js';
 import codeRoutes from './routes/courseRoutes.js';
 
-
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -39,13 +36,16 @@ connectDB();
 
 const app = express();
 
+// Trust proxy - IMPORTANT FOR RAILWAY/VERCEL
+app.set('trust proxy', 1);
+
 // CORS configuration - MUST BE FIRST
 app.use(cors({
   origin: [
-    'http://localhost:5173', 
-    'http://localhost:3000', 
+    'http://localhost:5173',
+    'http://localhost:3000',
     'http://127.0.0.1:5173',
-    'https://mr-solver-learn-hub.vercel.app'  // ✅ Add your Vercel URL
+    'https://mr-solver-learn-hub.vercel.app'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
@@ -62,15 +62,15 @@ app.use(helmet({
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 500,
-  message: { message: 'Too many requests, please try again later.' }
+  message: { message: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 app.use('/api', limiter);
 
 // Body parser
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-
 
 // Static files
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
@@ -96,7 +96,8 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'OK',
     message: 'LearnHub API is running',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV
   });
 });
 
@@ -109,7 +110,7 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🌐 URL: http://localhost:${PORT}`);
+  console.log(`🌐 Backend URL: ${process.env.BACKEND_URL || 'http://localhost:' + PORT}`);
 });
 
 export default app;

@@ -1,60 +1,34 @@
 // utils/imageHelper.js
 
-/**
- * Get the full URL for uploaded files
- * @param {string} relativePath - The relative path stored in database
- * @returns {string} - Full URL to the file
- */
 export const getFullImageUrl = (relativePath) => {
   if (!relativePath) return null;
   
-  // If already a full URL, return as is
-  if (relativePath.startsWith('http://') || relativePath.startsWith('https://')) {
+  const baseUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
+  
+  // If it's already a full URL with localhost, extract the path and use production URL
+  if (relativePath.includes('localhost')) {
+    // Extract path after /uploads/
+    const match = relativePath.match(/\/uploads\/(.+)$/);
+    if (match) {
+      return `${baseUrl}/uploads/${match[1]}`;
+    }
+  }
+  
+  // If it's already a correct production URL, return as-is
+  if (relativePath.startsWith('https://') && !relativePath.includes('localhost')) {
     return relativePath;
   }
   
-  const baseUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
+  // If it's http:// but not localhost (some other domain), return as-is
+  if (relativePath.startsWith('http://') && !relativePath.includes('localhost')) {
+    return relativePath;
+  }
   
   // Remove leading slash if present
   const cleanPath = relativePath.startsWith('/') ? relativePath.slice(1) : relativePath;
   
-  return `${baseUrl}/uploads/${cleanPath}`;
-};
-
-/**
- * Get relative path from full URL (for storing in database)
- * @param {string} fullUrl - The full URL
- * @returns {string} - Relative path
- */
-export const getRelativePath = (fullUrl) => {
-  if (!fullUrl) return null;
+  // Remove 'uploads/' prefix if present (to avoid duplication)
+  const finalPath = cleanPath.startsWith('uploads/') ? cleanPath.slice(8) : cleanPath;
   
-  // If already relative, return as is
-  if (!fullUrl.startsWith('http://') && !fullUrl.startsWith('https://')) {
-    return fullUrl;
-  }
-  
-  // Extract path after /uploads/
-  const match = fullUrl.match(/\/uploads\/(.+)$/);
-  return match ? match[1] : fullUrl;
-};
-
-/**
- * Transform object to include full image URLs
- * @param {Object} obj - Object with image fields
- * @param {Array} imageFields - Array of field names that contain image paths
- * @returns {Object} - Object with full URLs
- */
-export const transformImageUrls = (obj, imageFields = []) => {
-  if (!obj) return obj;
-  
-  const transformed = { ...obj };
-  
-  imageFields.forEach(field => {
-    if (transformed[field]) {
-      transformed[field] = getFullImageUrl(transformed[field]);
-    }
-  });
-  
-  return transformed;
+  return `${baseUrl}/uploads/${finalPath}`;
 };
