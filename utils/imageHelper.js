@@ -1,36 +1,37 @@
 // utils/imageHelper.js
 
-export const getFullImageUrl = (path) => {
-  if (!path) return null;
+export const getFullImageUrl = (imagePath) => {
+  // Return null for empty values
+  if (!imagePath || imagePath === '' || imagePath === 'null' || imagePath === 'undefined') {
+    return null;
+  }
+
+  // Convert to string
+  const path = String(imagePath);
+
+  // Get backend URL from environment
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`;
   
-  const BACKEND_URL = process.env.BACKEND_URL || 'https://mrsolver-learnhub-backend-production.up.railway.app';
-  
-  // Already correct production URL
-  if (path.startsWith(BACKEND_URL)) {
+  // If it's already a full production URL, return as-is
+  if (path.startsWith(backendUrl)) {
     return path;
   }
-  
-  // Handle localhost URLs - extract path and use production URL
-  if (path.includes('localhost:5000') || path.includes('localhost:3000')) {
-    const match = path.match(/\/uploads\/(.+)$/);
-    if (match) {
-      return `${BACKEND_URL}/uploads/${match[1]}`;
+
+  // If it's a localhost URL, extract relative path
+  if (path.includes('localhost') || path.includes('127.0.0.1')) {
+    const uploadsIndex = path.indexOf('/uploads/');
+    if (uploadsIndex !== -1) {
+      const relativePath = path.substring(uploadsIndex + 9);
+      return `${backendUrl}/uploads/${relativePath}`;
     }
   }
-  
-  // Handle other http/https URLs (external images)
+
+  // If it's an external URL (cloudinary, s3, etc.), return as-is
   if (path.startsWith('http://') || path.startsWith('https://')) {
-    // If it's localhost, fix it
-    if (path.includes('localhost')) {
-      const match = path.match(/\/uploads\/(.+)$/);
-      if (match) {
-        return `${BACKEND_URL}/uploads/${match[1]}`;
-      }
-    }
     return path;
   }
-  
-  // Handle relative paths (e.g., "avatars/image.jpg" or "/uploads/avatars/image.jpg")
+
+  // Handle relative paths
   let cleanPath = path;
   
   // Remove leading slash
@@ -38,10 +39,12 @@ export const getFullImageUrl = (path) => {
     cleanPath = cleanPath.slice(1);
   }
   
-  // Remove "uploads/" prefix if present
+  // Remove 'uploads/' prefix if present
   if (cleanPath.startsWith('uploads/')) {
     cleanPath = cleanPath.slice(8);
   }
-  
-  return `${BACKEND_URL}/uploads/${cleanPath}`;
+
+  return `${backendUrl}/uploads/${cleanPath}`;
 };
+
+export default { getFullImageUrl };

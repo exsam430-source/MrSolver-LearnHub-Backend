@@ -4,6 +4,7 @@ import User from '../models/User.js';
 import Course from '../models/Course.js';
 import Category from '../models/Category.js';
 import Review from '../models/Review.js';
+import { getFullImageUrl } from '../utils/imageHelper.js';
 
 // @desc    Get home page data (stats + testimonials)
 // @route   GET /api/site/home
@@ -40,6 +41,18 @@ export const getHomeData = asyncHandler(async (req, res) => {
   const avgRating = avgRatingAgg?.[0]?.avg || 0;
   const reviewsCount = avgRatingAgg?.[0]?.count || 0;
 
+  // ✅ Transform testimonials with full image URLs
+  const transformedTestimonials = testimonials.map(t => {
+    const obj = t.toObject ? t.toObject() : t;
+    return {
+      ...obj,
+      student: obj.student ? {
+        ...obj.student,
+        avatar: getFullImageUrl(obj.student.avatar)
+      } : obj.student
+    };
+  });
+
   // Debug log
   console.log('📊 Home Data Stats:', {
     students: studentsCount,
@@ -48,7 +61,7 @@ export const getHomeData = asyncHandler(async (req, res) => {
     categories: categoriesCount,
     avgRating: Math.round(avgRating * 10) / 10,
     reviews: reviewsCount,
-    testimonials: testimonials.length
+    testimonials: transformedTestimonials.length
   });
 
   res.json({
@@ -62,7 +75,7 @@ export const getHomeData = asyncHandler(async (req, res) => {
         avgRating: Math.round(avgRating * 10) / 10,
         reviewsCount
       },
-      testimonials
+      testimonials: transformedTestimonials
     }
   });
 });
@@ -81,9 +94,22 @@ export const getFeaturedCourses = asyncHandler(async (req, res) => {
     .limit(8)
     .sort({ enrollmentCount: -1 });
 
+  // ✅ Transform courses with full image URLs
+  const transformedCourses = courses.map(course => {
+    const obj = course.toObject ? course.toObject() : course;
+    return {
+      ...obj,
+      thumbnail: getFullImageUrl(obj.thumbnail),
+      instructor: obj.instructor ? {
+        ...obj.instructor,
+        avatar: getFullImageUrl(obj.instructor.avatar)
+      } : obj.instructor
+    };
+  });
+
   res.json({
     success: true,
-    data: courses
+    data: transformedCourses
   });
 });
 
@@ -102,8 +128,12 @@ export const getHomeCategories = asyncHandler(async (req, res) => {
         category: category._id,
         isPublished: true
       });
+      
+      const obj = category.toObject ? category.toObject() : category;
+      
       return {
-        ...category.toObject(),
+        ...obj,
+        image: getFullImageUrl(obj.image),
         coursesCount
       };
     })
