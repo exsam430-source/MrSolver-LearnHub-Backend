@@ -1,12 +1,28 @@
 // controllers/courseController.js
 import asyncHandler from 'express-async-handler';
-import mongoose from 'mongoose';  // ADD THIS
+import mongoose from 'mongoose';
 import Course from '../models/Course.js';
-import Category from '../models/Category.js';  // ADD THIS
+import Category from '../models/Category.js';
 import Lecture from '../models/Lecture.js';
 import Enrollment from '../models/Enrollment.js';
 import User from '../models/User.js';
 import { paginate, buildPaginationResponse } from '../utils/helpers.js';
+import { getFullImageUrl } from '../utils/imageHelper.js';
+
+// Helper to transform course
+const transformCourse = (course) => {
+  if (!course) return course;
+  const obj = course.toObject ? course.toObject() : course;
+  return {
+    ...obj,
+    thumbnail: getFullImageUrl(obj.thumbnail),
+    certificateTemplate: getFullImageUrl(obj.certificateTemplate),
+    instructor: obj.instructor ? {
+      ...obj.instructor,
+      avatar: getFullImageUrl(obj.instructor.avatar)
+    } : obj.instructor
+  };
+};
 
 // Helper function to get category ID from slug or ID
 const getCategoryId = async (categoryParam) => {
@@ -14,12 +30,10 @@ const getCategoryId = async (categoryParam) => {
     return null;
   }
 
-  // Check if it's a valid ObjectId
   if (mongoose.Types.ObjectId.isValid(categoryParam)) {
     return categoryParam;
   }
 
-  // It's a slug, find the category
   const category = await Category.findOne({
     $or: [
       { slug: categoryParam.toLowerCase() },
@@ -46,7 +60,6 @@ export const getCourses = asyncHandler(async (req, res) => {
 
   const query = { isPublished: true };
 
-  // Search
   if (search && search.trim() !== '') {
     query.$or = [
       { title: { $regex: search, $options: 'i' } },
@@ -55,13 +68,11 @@ export const getCourses = asyncHandler(async (req, res) => {
     ];
   }
 
-  // Category filter - Handle both ObjectId and slug
   if (category && category !== '' && category !== 'all') {
     const categoryId = await getCategoryId(category);
     if (categoryId) {
       query.category = categoryId;
     } else {
-      // Category not found, return empty results
       return res.json({
         success: true,
         data: [],
@@ -70,15 +81,11 @@ export const getCourses = asyncHandler(async (req, res) => {
     }
   }
 
-  // Level filter
   if (level && level !== 'all' && level !== '') {
     query.level = level;
   }
 
-  // Price filter
   if (price === 'free') {
-    query.$or = query.$or || [];
-    // Remove $or if it was set by search, handle separately
     if (!search) {
       query.$or = [{ isFreeCourse: true }, { price: 0 }];
     } else {
@@ -89,14 +96,12 @@ export const getCourses = asyncHandler(async (req, res) => {
     query.price = { $gt: 0 };
   }
 
-  // Instructor filter
   if (instructor) {
     if (mongoose.Types.ObjectId.isValid(instructor)) {
       query.instructor = instructor;
     }
   }
 
-  // Sort options
   let sortOptions = {};
   switch (sort) {
     case 'newest':
@@ -132,7 +137,7 @@ export const getCourses = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: courses,
+    data: courses.map(transformCourse),
     pagination: buildPaginationResponse(total, page, limit)
   });
 });
@@ -150,7 +155,7 @@ export const getFeaturedCourses = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: courses
+    data: courses.map(transformCourse)
   });
 });
 
@@ -171,7 +176,6 @@ export const getCourseBySlug = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  // Check if user is enrolled
   let isEnrolled = false;
   if (req.user) {
     const enrollment = await Enrollment.findOne({
@@ -185,7 +189,7 @@ export const getCourseBySlug = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     data: {
-      ...course.toObject(),
+      ...transformCourse(course),
       isEnrolled
     }
   });
@@ -213,7 +217,6 @@ export const getCourseById = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  // Check ownership (instructors can only see their own, admins can see all)
   if (
     req.user.role !== 'admin' &&
     course.instructor._id.toString() !== req.user._id.toString()
@@ -224,7 +227,7 @@ export const getCourseById = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: course
+    data: transformCourse(course)
   });
 });
 
@@ -249,10 +252,8 @@ export const createCourse = asyncHandler(async (req, res) => {
     instructorId
   } = req.body;
 
-  // Determine instructor
   let instructor = req.user._id;
 
-  // If admin is creating and provided instructorId, use that
   if (req.user.role === 'admin' && instructorId) {
     const instructorUser = await User.findById(instructorId);
     if (!instructorUser || !['instructor', 'admin'].includes(instructorUser.role)) {
@@ -281,7 +282,7 @@ export const createCourse = asyncHandler(async (req, res) => {
 
   res.status(201).json({
     success: true,
-    data: course
+    data: transformCourse(course)
   });
 });
 
@@ -296,7 +297,6 @@ export const updateCourse = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  // Check ownership (admin can update any course)
   if (
     req.user.role !== 'admin' &&
     course.instructor.toString() !== req.user._id.toString()
@@ -305,7 +305,6 @@ export const updateCourse = asyncHandler(async (req, res) => {
     throw new Error('Not authorized to update this course');
   }
 
-  // If admin is updating instructorId
   if (req.user.role === 'admin' && req.body.instructorId) {
     const instructorUser = await User.findById(req.body.instructorId);
     if (instructorUser && ['instructor', 'admin'].includes(instructorUser.role)) {
@@ -321,7 +320,7 @@ export const updateCourse = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: course
+    data: transformCourse(course)
   });
 });
 
@@ -341,7 +340,6 @@ export const updateCourseThumbnail = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     course.instructor.toString() !== req.user._id.toString()
@@ -355,7 +353,7 @@ export const updateCourseThumbnail = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: { thumbnail: course.thumbnail }
+    data: { thumbnail: getFullImageUrl(course.thumbnail) }
   });
 });
 
@@ -370,7 +368,6 @@ export const deleteCourse = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     course.instructor.toString() !== req.user._id.toString()
@@ -379,14 +376,12 @@ export const deleteCourse = asyncHandler(async (req, res) => {
     throw new Error('Not authorized to delete this course');
   }
 
-  // Check for enrollments
   const enrollments = await Enrollment.countDocuments({ course: course._id });
   if (enrollments > 0 && req.user.role !== 'admin') {
     res.status(400);
     throw new Error('Cannot delete course with active enrollments');
   }
 
-  // Delete associated lectures
   await Lecture.deleteMany({ course: course._id });
 
   await course.deleteOne();
@@ -408,7 +403,6 @@ export const togglePublish = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     course.instructor.toString() !== req.user._id.toString()
@@ -417,7 +411,6 @@ export const togglePublish = asyncHandler(async (req, res) => {
     throw new Error('Not authorized');
   }
 
-  // Validate course has content before publishing
   if (!course.isPublished) {
     const lectureCount = await Lecture.countDocuments({ course: course._id });
     if (lectureCount === 0) {
@@ -451,7 +444,6 @@ export const addSection = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     course.instructor.toString() !== req.user._id.toString()
@@ -495,7 +487,6 @@ export const updateSection = asyncHandler(async (req, res) => {
     throw new Error('Section not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     course.instructor.toString() !== req.user._id.toString()
@@ -532,7 +523,6 @@ export const deleteSection = asyncHandler(async (req, res) => {
     throw new Error('Section not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     course.instructor.toString() !== req.user._id.toString()
@@ -541,14 +531,12 @@ export const deleteSection = asyncHandler(async (req, res) => {
     throw new Error('Not authorized');
   }
 
-  // Delete all lectures in this section
   const lectureIds = course.curriculum[sectionIndex].lectures;
   await Lecture.deleteMany({ _id: { $in: lectureIds } });
 
   course.curriculum.splice(sectionIndex, 1);
   await course.save();
 
-  // Update totalLectures count
   const totalLectures = await Lecture.countDocuments({ course: course._id });
   course.totalLectures = totalLectures;
   await course.save();
@@ -587,7 +575,7 @@ export const getInstructorCourses = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: courses,
+    data: courses.map(transformCourse),
     pagination: buildPaginationResponse(total, page, limit)
   });
 });
@@ -614,7 +602,6 @@ export const getAllCoursesAdmin = asyncHandler(async (req, res) => {
     ];
   }
 
-  // Handle category - both ObjectId and slug
   if (category && category !== 'all') {
     const categoryId = await getCategoryId(category);
     if (categoryId) {
@@ -622,7 +609,6 @@ export const getAllCoursesAdmin = asyncHandler(async (req, res) => {
     }
   }
 
-  // Handle instructor
   if (instructor) {
     if (mongoose.Types.ObjectId.isValid(instructor)) {
       query.instructor = instructor;
@@ -631,7 +617,7 @@ export const getAllCoursesAdmin = asyncHandler(async (req, res) => {
 
   const total = await Course.countDocuments(query);
   const courses = await Course.find(query)
-    .populate('instructor', 'firstName lastName email')
+    .populate('instructor', 'firstName lastName email avatar')
     .populate('category', 'name')
     .sort({ createdAt: -1 })
     .skip(skip)
@@ -639,7 +625,7 @@ export const getAllCoursesAdmin = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: courses,
+    data: courses.map(transformCourse),
     pagination: buildPaginationResponse(total, page, limit)
   });
 });

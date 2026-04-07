@@ -1,20 +1,44 @@
 // controllers/reviewController.js
 import asyncHandler from 'express-async-handler';
-import mongoose from 'mongoose';  // ADD THIS IMPORT
+import mongoose from 'mongoose';
 import Review from '../models/Review.js';
 import Course from '../models/Course.js';
 import Enrollment from '../models/Enrollment.js';
 import { paginate, buildPaginationResponse } from '../utils/helpers.js';
+import { getFullImageUrl } from '../utils/imageHelper.js';
 
-// @desc    Get reviews for a course
-// @route   GET /api/reviews/course/:courseId
-// @access  Public
+// Helper to transform review
+const transformReview = (review) => {
+  if (!review) return review;
+  const obj = review.toObject ? review.toObject() : review;
+  return {
+    ...obj,
+    student: obj.student ? {
+      ...obj.student,
+      avatar: getFullImageUrl(obj.student.avatar)
+    } : obj.student,
+    course: obj.course ? {
+      ...obj.course,
+      thumbnail: getFullImageUrl(obj.course.thumbnail)
+    } : obj.course,
+    response: obj.response ? {
+      ...obj.response,
+      respondedBy: obj.response.respondedBy ? {
+        ...obj.response.respondedBy,
+        avatar: getFullImageUrl(obj.response.respondedBy.avatar)
+      } : obj.response.respondedBy
+    } : obj.response
+  };
+};
+
+// @desc Get reviews for a course
+// @route GET /api/reviews/course/:courseId
+// @access Public
 export const getCourseReviews = asyncHandler(async (req, res) => {
   const { page, limit, skip } = paginate(req.query.page, req.query.limit);
   const { sort } = req.query;
   const { courseId } = req.params;
 
-  // Validate courseId
   if (!mongoose.Types.ObjectId.isValid(courseId)) {
     res.status(400);
     throw new Error('Invalid course ID');
@@ -29,7 +53,6 @@ export const getCourseReviews = asyncHandler(async (req, res) => {
     sortOptions = { helpfulCount: -1 };
   }
 
-  // Convert to ObjectId for query
   const courseObjectId = new mongoose.Types.ObjectId(courseId);
 
   const query = { course: courseObjectId, isApproved: true };
@@ -37,12 +60,11 @@ export const getCourseReviews = asyncHandler(async (req, res) => {
 
   const reviews = await Review.find(query)
     .populate('student', 'firstName lastName avatar')
-    .populate('response.respondedBy', 'firstName lastName')
+    .populate('response.respondedBy', 'firstName lastName avatar')
     .sort(sortOptions)
     .skip(skip)
     .limit(limit);
 
-  // Calculate rating distribution with ObjectId
   const ratingDistribution = await Review.aggregate([
     { $match: { course: courseObjectId, isApproved: true } },
     { $group: { _id: '$rating', count: { $sum: 1 } } },
@@ -51,25 +73,23 @@ export const getCourseReviews = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: reviews,
+    data: reviews.map(transformReview),
     ratingDistribution,
     pagination: buildPaginationResponse(total, page, limit)
   });
 });
 
-// @desc    Get review stats for a course
-// @route   GET /api/reviews/stats/:courseId
-// @access  Public
+// @desc Get review stats for a course
+// @route GET /api/reviews/stats/:courseId
+// @access Public
 export const getReviewStats = asyncHandler(async (req, res) => {
   const { courseId } = req.params;
 
-  // Validate courseId
   if (!mongoose.Types.ObjectId.isValid(courseId)) {
     res.status(400);
     throw new Error('Invalid course ID');
   }
 
-  // Convert to ObjectId for aggregate
   const courseObjectId = new mongoose.Types.ObjectId(courseId);
 
   const stats = await Review.aggregate([
@@ -99,8 +119,7 @@ export const getReviewStats = asyncHandler(async (req, res) => {
   };
 
   const result = stats[0] || defaultStats;
-  
-  // Round average rating
+
   if (result.averageRating) {
     result.averageRating = Math.round(result.averageRating * 10) / 10;
   }
@@ -113,9 +132,9 @@ export const getReviewStats = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Get my reviews
-// @route   GET /api/reviews/my-reviews
-// @access  Private
+// @desc Get my reviews
+// @route GET /api/reviews/my-reviews
+// @access Private
 export const getMyReviews = asyncHandler(async (req, res) => {
   const reviews = await Review.find({ student: req.user._id })
     .populate('course', 'title slug thumbnail')
@@ -123,18 +142,18 @@ export const getMyReviews = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: reviews
+    data: reviews.map(transformReview)
   });
 });
 
-// @desc    Get single review
-// @route   GET /api/reviews/:id
-// @access  Public
+// @desc Get single review
+// @route GET /api/reviews/:id
+// @access Public
 export const getReview = asyncHandler(async (req, res) => {
   const review = await Review.findById(req.params.id)
     .populate('student', 'firstName lastName avatar')
-    .populate('course', 'title slug')
-    .populate('response.respondedBy', 'firstName lastName');
+    .populate('course', 'title slug thumbnail')
+    .populate('response.respondedBy', 'firstName lastName avatar');
 
   if (!review) {
     res.status(404);
@@ -143,17 +162,16 @@ export const getReview = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: review
+    data: transformReview(review)
   });
 });
 
-// @desc    Add review
-// @route   POST /api/reviews
-// @access  Private
+// @desc Add review
+// @route POST /api/reviews
+// @access Private
 export const addReview = asyncHandler(async (req, res) => {
   const { courseId, rating, title, comment } = req.body;
 
-  // Validate courseId
   if (!mongoose.Types.ObjectId.isValid(courseId)) {
     res.status(400);
     throw new Error('Invalid course ID');
@@ -161,7 +179,6 @@ export const addReview = asyncHandler(async (req, res) => {
 
   const courseObjectId = new mongoose.Types.ObjectId(courseId);
 
-  // Check if enrolled
   const enrollment = await Enrollment.findOne({
     student: req.user._id,
     course: courseObjectId,
@@ -173,7 +190,6 @@ export const addReview = asyncHandler(async (req, res) => {
     throw new Error('You must be enrolled in the course to leave a review');
   }
 
-  // Check for existing review
   const existingReview = await Review.findOne({
     student: req.user._id,
     course: courseObjectId
@@ -194,21 +210,19 @@ export const addReview = asyncHandler(async (req, res) => {
     isApproved: true
   });
 
-  // Populate student info for response
   await review.populate('student', 'firstName lastName avatar');
 
-  // Update course rating
   await updateCourseRating(courseObjectId);
 
   res.status(201).json({
     success: true,
-    data: review
+    data: transformReview(review)
   });
 });
 
-// @desc    Update review
-// @route   PUT /api/reviews/:id
-// @access  Private
+// @desc Update review
+// @route PUT /api/reviews/:id
+// @access Private
 export const updateReview = asyncHandler(async (req, res) => {
   const { rating, title, comment } = req.body;
 
@@ -219,7 +233,6 @@ export const updateReview = asyncHandler(async (req, res) => {
     throw new Error('Review not found');
   }
 
-  // Check ownership
   if (review.student.toString() !== req.user._id.toString()) {
     res.status(403);
     throw new Error('Not authorized to update this review');
@@ -232,18 +245,17 @@ export const updateReview = asyncHandler(async (req, res) => {
   await review.save();
   await review.populate('student', 'firstName lastName avatar');
 
-  // Update course rating
   await updateCourseRating(review.course);
 
   res.json({
     success: true,
-    data: review
+    data: transformReview(review)
   });
 });
 
-// @desc    Delete review
-// @route   DELETE /api/reviews/:id
-// @access  Private
+// @desc Delete review
+// @route DELETE /api/reviews/:id
+// @access Private
 export const deleteReview = asyncHandler(async (req, res) => {
   const review = await Review.findById(req.params.id);
 
@@ -252,7 +264,6 @@ export const deleteReview = asyncHandler(async (req, res) => {
     throw new Error('Review not found');
   }
 
-  // Check ownership or admin
   if (
     review.student.toString() !== req.user._id.toString() &&
     req.user.role !== 'admin'
@@ -264,7 +275,6 @@ export const deleteReview = asyncHandler(async (req, res) => {
   const courseId = review.course;
   await review.deleteOne();
 
-  // Update course rating
   await updateCourseRating(courseId);
 
   res.json({
@@ -273,9 +283,9 @@ export const deleteReview = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Mark review as helpful
-// @route   POST /api/reviews/:id/helpful
-// @access  Private
+// @desc Mark review as helpful
+// @route POST /api/reviews/:id/helpful
+// @access Private
 export const markHelpful = asyncHandler(async (req, res) => {
   const review = await Review.findById(req.params.id);
 
@@ -284,19 +294,16 @@ export const markHelpful = asyncHandler(async (req, res) => {
     throw new Error('Review not found');
   }
 
-  // Check if already marked
   const alreadyMarked = review.helpfulBy.some(
     id => id.toString() === req.user._id.toString()
   );
 
   if (alreadyMarked) {
-    // Remove mark
     review.helpfulBy = review.helpfulBy.filter(
       id => id.toString() !== req.user._id.toString()
     );
     review.helpfulCount = Math.max(0, review.helpfulCount - 1);
   } else {
-    // Add mark
     review.helpfulBy.push(req.user._id);
     review.helpfulCount += 1;
   }
@@ -312,9 +319,9 @@ export const markHelpful = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Add response to review (Instructor)
-// @route   POST /api/reviews/:id/respond
-// @access  Private/Instructor
+// @desc Add response to review (Instructor)
+// @route POST /api/reviews/:id/respond
+// @access Private/Instructor
 export const respondToReview = asyncHandler(async (req, res) => {
   const { content } = req.body;
 
@@ -326,7 +333,6 @@ export const respondToReview = asyncHandler(async (req, res) => {
     throw new Error('Review not found');
   }
 
-  // Check if instructor owns the course or is admin
   if (
     review.course.instructor.toString() !== req.user._id.toString() &&
     req.user.role !== 'admin'
@@ -342,17 +348,17 @@ export const respondToReview = asyncHandler(async (req, res) => {
   };
 
   await review.save();
-  await review.populate('response.respondedBy', 'firstName lastName');
+  await review.populate('response.respondedBy', 'firstName lastName avatar');
 
   res.json({
     success: true,
-    data: review
+    data: transformReview(review)
   });
 });
 
-// @desc    Delete response from review
-// @route   DELETE /api/reviews/:id/respond
-// @access  Private/Instructor
+// @desc Delete response from review
+// @route DELETE /api/reviews/:id/respond
+// @access Private/Instructor
 export const deleteResponse = asyncHandler(async (req, res) => {
   const review = await Review.findById(req.params.id)
     .populate('course', 'instructor');
@@ -362,7 +368,6 @@ export const deleteResponse = asyncHandler(async (req, res) => {
     throw new Error('Review not found');
   }
 
-  // Check if instructor owns the course or is admin
   if (
     review.course.instructor.toString() !== req.user._id.toString() &&
     req.user.role !== 'admin'
@@ -380,9 +385,9 @@ export const deleteResponse = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Get all reviews (Admin)
-// @route   GET /api/reviews/admin/all
-// @access  Private/Admin
+// @desc Get all reviews (Admin)
+// @route GET /api/reviews/admin/all
+// @access Private/Admin
 export const getAllReviewsAdmin = asyncHandler(async (req, res) => {
   const { page, limit, skip } = paginate(req.query.page, req.query.limit);
   const { status, course, rating } = req.query;
@@ -406,21 +411,21 @@ export const getAllReviewsAdmin = asyncHandler(async (req, res) => {
   const total = await Review.countDocuments(query);
   const reviews = await Review.find(query)
     .populate('student', 'firstName lastName email avatar')
-    .populate('course', 'title slug')
+    .populate('course', 'title slug thumbnail')
     .sort({ createdAt: -1 })
     .skip(skip)
     .limit(limit);
 
   res.json({
     success: true,
-    data: reviews,
+    data: reviews.map(transformReview),
     pagination: buildPaginationResponse(total, page, limit)
   });
 });
 
-// @desc    Approve/Reject review (Admin)
-// @route   PATCH /api/reviews/:id/approve
-// @access  Private/Admin
+// @desc Approve/Reject review (Admin)
+// @route PATCH /api/reviews/:id/approve
+// @access Private/Admin
 export const toggleApproval = asyncHandler(async (req, res) => {
   const review = await Review.findById(req.params.id);
 
@@ -432,7 +437,6 @@ export const toggleApproval = asyncHandler(async (req, res) => {
   review.isApproved = !review.isApproved;
   await review.save();
 
-  // Update course rating
   await updateCourseRating(review.course);
 
   res.json({
@@ -444,7 +448,7 @@ export const toggleApproval = asyncHandler(async (req, res) => {
 // Helper function to update course rating
 const updateCourseRating = async (courseId) => {
   try {
-    const courseObjectId = mongoose.Types.ObjectId.isValid(courseId) 
+    const courseObjectId = mongoose.Types.ObjectId.isValid(courseId)
       ? new mongoose.Types.ObjectId(courseId)
       : courseId;
 

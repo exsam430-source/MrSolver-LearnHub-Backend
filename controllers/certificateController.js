@@ -8,17 +8,40 @@ import Course from '../models/Course.js';
 import Enrollment from '../models/Enrollment.js';
 import User from '../models/User.js';
 import { paginate, buildPaginationResponse } from '../utils/helpers.js';
+import { getFullImageUrl } from '../utils/imageHelper.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Helper to transform certificate
+const transformCertificate = (certificate) => {
+  if (!certificate) return certificate;
+  const obj = certificate.toObject ? certificate.toObject() : certificate;
+  return {
+    ...obj,
+    certificateUrl: getFullImageUrl(obj.certificateUrl),
+    student: obj.student ? {
+      ...obj.student,
+      avatar: getFullImageUrl(obj.student.avatar)
+    } : obj.student,
+    course: obj.course ? {
+      ...obj.course,
+      thumbnail: getFullImageUrl(obj.course.thumbnail)
+    } : obj.course,
+    instructor: obj.instructor ? {
+      ...obj.instructor,
+      avatar: getFullImageUrl(obj.instructor.avatar)
+    } : obj.instructor
+  };
+};
 
 // ========================================
 // TEMPLATE MANAGEMENT
 // ========================================
 
-// @desc    Upload certificate template (PDF)
-// @route   PUT /api/certificates/course/:courseId/template
-// @access  Private/Instructor
+// @desc Upload certificate template (PDF)
+// @route PUT /api/certificates/course/:courseId/template
+// @access Private/Instructor
 export const uploadCertificateTemplate = asyncHandler(async (req, res) => {
   const { courseId } = req.params;
 
@@ -33,7 +56,6 @@ export const uploadCertificateTemplate = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     course.instructor.toString() !== req.user._id.toString()
@@ -42,7 +64,6 @@ export const uploadCertificateTemplate = asyncHandler(async (req, res) => {
     throw new Error('Not authorized to update this course');
   }
 
-  // Delete old template if exists
   if (course.certificateTemplate) {
     const oldPath = path.join(__dirname, '..', 'uploads', course.certificateTemplate);
     if (fs.existsSync(oldPath)) {
@@ -55,22 +76,22 @@ export const uploadCertificateTemplate = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: { 
-      certificateTemplate: course.certificateTemplate 
+    data: {
+      certificateTemplate: getFullImageUrl(course.certificateTemplate)
     },
     message: 'Certificate template uploaded successfully'
   });
 });
 
-// @desc    Update certificate settings for a course
-// @route   PUT /api/certificates/course/:courseId/settings
-// @access  Private/Instructor
+// @desc Update certificate settings for a course
+// @route PUT /api/certificates/course/:courseId/settings
+// @access Private/Instructor
 export const updateCertificateSettings = asyncHandler(async (req, res) => {
   const { courseId } = req.params;
-  const { 
-    completionCertificate, 
-    autoIssue, 
-    minimumScore, 
+  const {
+    completionCertificate,
+    autoIssue,
+    minimumScore,
     requireAllLectures,
     customMessage,
     expiryMonths,
@@ -83,7 +104,6 @@ export const updateCertificateSettings = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     course.instructor.toString() !== req.user._id.toString()
@@ -113,7 +133,7 @@ export const updateCertificateSettings = asyncHandler(async (req, res) => {
     data: {
       completionCertificate: course.completionCertificate,
       certificateSettings: course.certificateSettings,
-      certificateTemplate: course.certificateTemplate
+      certificateTemplate: getFullImageUrl(course.certificateTemplate)
     },
     message: 'Certificate settings updated successfully'
   });
@@ -123,22 +143,20 @@ export const updateCertificateSettings = asyncHandler(async (req, res) => {
 // CERTIFICATE ISSUANCE
 // ========================================
 
-// @desc    Issue certificate to a student
-// @route   POST /api/certificates/issue
-// @access  Private/Instructor
+// @desc Issue certificate to a student
+// @route POST /api/certificates/issue
+// @access Private/Instructor
 export const issueCertificate = asyncHandler(async (req, res) => {
   const { studentId, courseId, grade, customMessage } = req.body;
 
-  // Validate course
   const course = await Course.findById(courseId)
     .populate('instructor', 'firstName lastName');
-  
+
   if (!course) {
     res.status(404);
     throw new Error('Course not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     course.instructor._id.toString() !== req.user._id.toString()
@@ -147,19 +165,16 @@ export const issueCertificate = asyncHandler(async (req, res) => {
     throw new Error('Not authorized to issue certificates for this course');
   }
 
-  // Check if certificate is enabled
   if (!course.completionCertificate) {
     res.status(400);
     throw new Error('Certificates are not enabled for this course');
   }
 
-  // Check for template
   if (!course.certificateTemplate) {
     res.status(400);
     throw new Error('Please upload a certificate template first');
   }
 
-  // Validate student enrollment
   const enrollment = await Enrollment.findOne({
     student: studentId,
     course: courseId
@@ -170,7 +185,6 @@ export const issueCertificate = asyncHandler(async (req, res) => {
     throw new Error('Student is not enrolled in this course');
   }
 
-  // Check if already issued
   const existingCert = await Certificate.findOne({
     student: studentId,
     course: courseId,
@@ -182,14 +196,12 @@ export const issueCertificate = asyncHandler(async (req, res) => {
     throw new Error('Certificate already issued to this student');
   }
 
-  // Calculate expiry date if set
   let expiryDate = null;
   if (course.certificateSettings?.expiryMonths > 0) {
     expiryDate = new Date();
     expiryDate.setMonth(expiryDate.getMonth() + course.certificateSettings.expiryMonths);
   }
 
-  // Create certificate
   const certificate = await Certificate.create({
     student: studentId,
     course: courseId,
@@ -215,7 +227,6 @@ export const issueCertificate = asyncHandler(async (req, res) => {
     }
   });
 
-  // Update enrollment
   enrollment.certificateIssued = true;
   enrollment.certificateId = certificate._id;
   enrollment.certificateUrl = certificate.certificateUrl;
@@ -223,20 +234,20 @@ export const issueCertificate = asyncHandler(async (req, res) => {
   await enrollment.save();
 
   const populatedCert = await Certificate.findById(certificate._id)
-    .populate('student', 'firstName lastName email')
-    .populate('course', 'title slug')
-    .populate('instructor', 'firstName lastName');
+    .populate('student', 'firstName lastName email avatar')
+    .populate('course', 'title slug thumbnail')
+    .populate('instructor', 'firstName lastName avatar');
 
   res.status(201).json({
     success: true,
-    data: populatedCert,
+    data: transformCertificate(populatedCert),
     message: 'Certificate issued successfully'
   });
 });
 
-// @desc    Issue certificates to multiple students (bulk)
-// @route   POST /api/certificates/issue-bulk
-// @access  Private/Instructor
+// @desc Issue certificates to multiple students (bulk)
+// @route POST /api/certificates/issue-bulk
+// @access Private/Instructor
 export const issueCertificatesBulk = asyncHandler(async (req, res) => {
   const { courseId, studentIds, grade } = req.body;
 
@@ -247,13 +258,12 @@ export const issueCertificatesBulk = asyncHandler(async (req, res) => {
 
   const course = await Course.findById(courseId)
     .populate('instructor', 'firstName lastName');
-  
+
   if (!course) {
     res.status(404);
     throw new Error('Course not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     course.instructor._id.toString() !== req.user._id.toString()
@@ -275,7 +285,6 @@ export const issueCertificatesBulk = asyncHandler(async (req, res) => {
 
   for (const studentId of studentIds) {
     try {
-      // Check existing certificate
       const existingCert = await Certificate.findOne({
         student: studentId,
         course: courseId,
@@ -283,14 +292,13 @@ export const issueCertificatesBulk = asyncHandler(async (req, res) => {
       });
 
       if (existingCert) {
-        results.alreadyIssued.push({ 
-          studentId, 
-          certificateNumber: existingCert.certificateNumber 
+        results.alreadyIssued.push({
+          studentId,
+          certificateNumber: existingCert.certificateNumber
         });
         continue;
       }
 
-      // Get enrollment
       const enrollment = await Enrollment.findOne({
         student: studentId,
         course: courseId
@@ -301,14 +309,12 @@ export const issueCertificatesBulk = asyncHandler(async (req, res) => {
         continue;
       }
 
-      // Calculate expiry
       let expiryDate = null;
       if (course.certificateSettings?.expiryMonths > 0) {
         expiryDate = new Date();
         expiryDate.setMonth(expiryDate.getMonth() + course.certificateSettings.expiryMonths);
       }
 
-      // Create certificate
       const certificate = await Certificate.create({
         student: studentId,
         course: courseId,
@@ -334,7 +340,6 @@ export const issueCertificatesBulk = asyncHandler(async (req, res) => {
         }
       });
 
-      // Update enrollment
       enrollment.certificateIssued = true;
       enrollment.certificateId = certificate._id;
       enrollment.certificateUrl = certificate.certificateUrl;
@@ -349,9 +354,9 @@ export const issueCertificatesBulk = asyncHandler(async (req, res) => {
       });
 
     } catch (error) {
-      results.failed.push({ 
-        studentId, 
-        reason: error.message 
+      results.failed.push({
+        studentId,
+        reason: error.message
       });
     }
   }
@@ -367,9 +372,9 @@ export const issueCertificatesBulk = asyncHandler(async (req, res) => {
 // CERTIFICATE RETRIEVAL
 // ========================================
 
-// @desc    Get certificates issued by instructor
-// @route   GET /api/certificates/instructor
-// @access  Private/Instructor
+// @desc Get certificates issued by instructor
+// @route GET /api/certificates/instructor
+// @access Private/Instructor
 export const getInstructorCertificates = asyncHandler(async (req, res) => {
   const { page, limit, skip } = paginate(req.query.page, req.query.limit);
   const { courseId, status, search } = req.query;
@@ -385,7 +390,7 @@ export const getInstructorCertificates = asyncHandler(async (req, res) => {
   }
 
   const total = await Certificate.countDocuments(query);
-  
+
   let certificates = await Certificate.find(query)
     .populate('student', 'firstName lastName email avatar')
     .populate('course', 'title slug thumbnail')
@@ -393,10 +398,9 @@ export const getInstructorCertificates = asyncHandler(async (req, res) => {
     .skip(skip)
     .limit(limit);
 
-  // Filter by search if provided
   if (search) {
     const searchLower = search.toLowerCase();
-    certificates = certificates.filter(cert => 
+    certificates = certificates.filter(cert =>
       cert.metadata?.studentName?.toLowerCase().includes(searchLower) ||
       cert.certificateNumber?.toLowerCase().includes(searchLower) ||
       cert.course?.title?.toLowerCase().includes(searchLower)
@@ -405,37 +409,37 @@ export const getInstructorCertificates = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: certificates,
+    data: certificates.map(transformCertificate),
     pagination: buildPaginationResponse(total, page, limit)
   });
 });
 
-// @desc    Get student's certificates
-// @route   GET /api/certificates/my-certificates
-// @access  Private
+// @desc Get student's certificates
+// @route GET /api/certificates/my-certificates
+// @access Private
 export const getMyCertificates = asyncHandler(async (req, res) => {
-  const certificates = await Certificate.find({ 
+  const certificates = await Certificate.find({
     student: req.user._id,
     status: 'active'
   })
     .populate('course', 'title slug thumbnail instructor')
-    .populate('instructor', 'firstName lastName')
+    .populate('instructor', 'firstName lastName avatar')
     .sort({ issueDate: -1 });
 
   res.json({
     success: true,
-    data: certificates
+    data: certificates.map(transformCertificate)
   });
 });
 
-// @desc    Get certificate by ID
-// @route   GET /api/certificates/:id
-// @access  Private
+// @desc Get certificate by ID
+// @route GET /api/certificates/:id
+// @access Private
 export const getCertificate = asyncHandler(async (req, res) => {
   const certificate = await Certificate.findById(req.params.id)
     .populate('student', 'firstName lastName email avatar')
     .populate('course', 'title slug thumbnail')
-    .populate('instructor', 'firstName lastName')
+    .populate('instructor', 'firstName lastName avatar')
     .populate('issuedBy', 'firstName lastName');
 
   if (!certificate) {
@@ -443,7 +447,6 @@ export const getCertificate = asyncHandler(async (req, res) => {
     throw new Error('Certificate not found');
   }
 
-  // Check access - student, instructor, or admin
   const isStudent = certificate.student._id.toString() === req.user._id.toString();
   const isInstructor = certificate.instructor._id.toString() === req.user._id.toString();
   const isAdmin = req.user.role === 'admin';
@@ -455,13 +458,13 @@ export const getCertificate = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: certificate
+    data: transformCertificate(certificate)
   });
 });
 
-// @desc    Download certificate PDF
-// @route   GET /api/certificates/:id/download
-// @access  Private
+// @desc Download certificate PDF
+// @route GET /api/certificates/:id/download
+// @access Private
 export const downloadCertificate = asyncHandler(async (req, res) => {
   const certificate = await Certificate.findById(req.params.id);
 
@@ -470,7 +473,6 @@ export const downloadCertificate = asyncHandler(async (req, res) => {
     throw new Error('Certificate not found');
   }
 
-  // Check access
   const isStudent = certificate.student.toString() === req.user._id.toString();
   const isInstructor = certificate.instructor.toString() === req.user._id.toString();
   const isAdmin = req.user.role === 'admin';
@@ -480,7 +482,6 @@ export const downloadCertificate = asyncHandler(async (req, res) => {
     throw new Error('Not authorized to download this certificate');
   }
 
-  // Check if certificate is valid
   if (!certificate.isValid()) {
     res.status(400);
     throw new Error('This certificate is no longer valid');
@@ -493,14 +494,11 @@ export const downloadCertificate = asyncHandler(async (req, res) => {
     throw new Error('Certificate file not found');
   }
 
-  // Track download
   await certificate.trackDownload();
 
-  // Set headers for download
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="Certificate-${certificate.certificateNumber}.pdf"`);
-  
-  // Stream file
+
   const fileStream = fs.createReadStream(filePath);
   fileStream.pipe(res);
 });
@@ -509,9 +507,9 @@ export const downloadCertificate = asyncHandler(async (req, res) => {
 // VERIFICATION
 // ========================================
 
-// @desc    Verify certificate
-// @route   GET /api/certificates/verify/:code
-// @access  Public
+// @desc Verify certificate
+// @route GET /api/certificates/verify/:code
+// @access Public
 export const verifyCertificate = asyncHandler(async (req, res) => {
   const { code } = req.params;
 
@@ -555,9 +553,9 @@ export const verifyCertificate = asyncHandler(async (req, res) => {
 // CERTIFICATE MANAGEMENT
 // ========================================
 
-// @desc    Revoke certificate
-// @route   PUT /api/certificates/:id/revoke
-// @access  Private/Instructor
+// @desc Revoke certificate
+// @route PUT /api/certificates/:id/revoke
+// @access Private/Instructor
 export const revokeCertificate = asyncHandler(async (req, res) => {
   const { reason } = req.body;
 
@@ -568,7 +566,6 @@ export const revokeCertificate = asyncHandler(async (req, res) => {
     throw new Error('Certificate not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     certificate.instructor.toString() !== req.user._id.toString()
@@ -583,11 +580,10 @@ export const revokeCertificate = asyncHandler(async (req, res) => {
   certificate.revokeReason = reason || 'No reason provided';
   await certificate.save();
 
-  // Update enrollment
   await Enrollment.findOneAndUpdate(
     { student: certificate.student, course: certificate.course },
-    { 
-      certificateIssued: false, 
+    {
+      certificateIssued: false,
       certificateId: null,
       certificateUrl: null
     }
@@ -599,9 +595,9 @@ export const revokeCertificate = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Reissue certificate
-// @route   POST /api/certificates/:id/reissue
-// @access  Private/Instructor
+// @desc Reissue certificate
+// @route POST /api/certificates/:id/reissue
+// @access Private/Instructor
 export const reissueCertificate = asyncHandler(async (req, res) => {
   const oldCertificate = await Certificate.findById(req.params.id)
     .populate('student', 'firstName lastName email')
@@ -613,7 +609,6 @@ export const reissueCertificate = asyncHandler(async (req, res) => {
     throw new Error('Certificate not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     oldCertificate.instructor._id.toString() !== req.user._id.toString()
@@ -622,14 +617,12 @@ export const reissueCertificate = asyncHandler(async (req, res) => {
     throw new Error('Not authorized');
   }
 
-  // Revoke old certificate
   oldCertificate.status = 'revoked';
   oldCertificate.revokedBy = req.user._id;
   oldCertificate.revokedAt = new Date();
   oldCertificate.revokeReason = 'Reissued';
   await oldCertificate.save();
 
-  // Create new certificate
   const newCertificate = await Certificate.create({
     student: oldCertificate.student._id,
     course: oldCertificate.course._id,
@@ -643,10 +636,9 @@ export const reissueCertificate = asyncHandler(async (req, res) => {
     metadata: oldCertificate.metadata
   });
 
-  // Update enrollment
   await Enrollment.findOneAndUpdate(
     { student: oldCertificate.student._id, course: oldCertificate.course._id },
-    { 
+    {
       certificateId: newCertificate._id,
       certificateUrl: newCertificate.certificateUrl,
       certificateIssuedAt: newCertificate.issueDate
@@ -654,13 +646,13 @@ export const reissueCertificate = asyncHandler(async (req, res) => {
   );
 
   const populatedCert = await Certificate.findById(newCertificate._id)
-    .populate('student', 'firstName lastName email')
-    .populate('course', 'title slug')
-    .populate('instructor', 'firstName lastName');
+    .populate('student', 'firstName lastName email avatar')
+    .populate('course', 'title slug thumbnail')
+    .populate('instructor', 'firstName lastName avatar');
 
   res.status(201).json({
     success: true,
-    data: populatedCert,
+    data: transformCertificate(populatedCert),
     message: 'Certificate reissued successfully'
   });
 });
@@ -669,9 +661,9 @@ export const reissueCertificate = asyncHandler(async (req, res) => {
 // STATISTICS
 // ========================================
 
-// @desc    Get course certificate stats
-// @route   GET /api/certificates/course/:courseId/stats
-// @access  Private/Instructor
+// @desc Get course certificate stats
+// @route GET /api/certificates/course/:courseId/stats
+// @access Private/Instructor
 export const getCourseCertificateStats = asyncHandler(async (req, res) => {
   const { courseId } = req.params;
 
@@ -681,7 +673,6 @@ export const getCourseCertificateStats = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     course.instructor.toString() !== req.user._id.toString()
@@ -731,9 +722,9 @@ export const getCourseCertificateStats = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Get eligible students for certificate
-// @route   GET /api/certificates/course/:courseId/eligible
-// @access  Private/Instructor
+// @desc Get eligible students for certificate
+// @route GET /api/certificates/course/:courseId/eligible
+// @access Private/Instructor
 export const getEligibleStudents = asyncHandler(async (req, res) => {
   const { courseId } = req.params;
 
@@ -743,7 +734,6 @@ export const getEligibleStudents = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  // Check ownership
   if (
     req.user.role !== 'admin' &&
     course.instructor.toString() !== req.user._id.toString()
@@ -752,7 +742,6 @@ export const getEligibleStudents = asyncHandler(async (req, res) => {
     throw new Error('Not authorized');
   }
 
-  // Find completed students without certificates
   const eligibleEnrollments = await Enrollment.find({
     course: courseId,
     status: 'completed',
@@ -761,8 +750,19 @@ export const getEligibleStudents = asyncHandler(async (req, res) => {
     .populate('student', 'firstName lastName email avatar')
     .select('student progress completedAt enrollmentDate');
 
+  const transformedEnrollments = eligibleEnrollments.map(enrollment => {
+    const obj = enrollment.toObject ? enrollment.toObject() : enrollment;
+    return {
+      ...obj,
+      student: obj.student ? {
+        ...obj.student,
+        avatar: getFullImageUrl(obj.student.avatar)
+      } : obj.student
+    };
+  });
+
   res.json({
     success: true,
-    data: eligibleEnrollments
+    data: transformedEnrollments
   });
 });

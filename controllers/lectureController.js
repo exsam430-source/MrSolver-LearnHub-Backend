@@ -4,11 +4,12 @@ import Lecture from '../models/Lecture.js';
 import Course from '../models/Course.js';
 import Enrollment from '../models/Enrollment.js';
 import { extractYouTubeId } from '../utils/helpers.js';
+import { getFullImageUrl } from '../utils/imageHelper.js';
 
 // Helper function to merge overlapping segments
 const mergeSegments = (segments) => {
   if (!segments || segments.length === 0) return [];
-  
+
   const sorted = [...segments].sort((a, b) => a.start - b.start);
   const merged = [{ ...sorted[0] }];
 
@@ -24,6 +25,29 @@ const mergeSegments = (segments) => {
   }
 
   return merged;
+};
+
+// Helper to transform lecture
+const transformLecture = (lecture) => {
+  if (!lecture) return lecture;
+  const obj = lecture.toObject ? lecture.toObject() : lecture;
+  
+  const transformed = { ...obj };
+  
+  if (transformed.content) {
+    if (transformed.content.videoUrl) {
+      transformed.content.videoUrl = getFullImageUrl(transformed.content.videoUrl);
+    }
+  }
+  
+  if (transformed.resources) {
+    transformed.resources = transformed.resources.map(r => ({
+      ...r,
+      url: getFullImageUrl(r.url)
+    }));
+  }
+  
+  return transformed;
 };
 
 // @desc Get lecture by ID
@@ -43,7 +67,6 @@ export const getLecture = asyncHandler(async (req, res) => {
   const courseId = lecture.course?._id || lecture.course;
   const instructorId = lecture.course?.instructor?._id || lecture.course?.instructor;
 
-  // Student must be enrolled OR lecture must be preview
   if (req.user.role === 'student') {
     const enrollment = await Enrollment.findOne({
       student: req.user._id,
@@ -62,7 +85,6 @@ export const getLecture = asyncHandler(async (req, res) => {
     }
   }
 
-  // Instructor must own the course
   if (req.user.role === 'instructor') {
     if (instructorId?.toString() !== req.user._id.toString()) {
       res.status(403);
@@ -70,7 +92,7 @@ export const getLecture = asyncHandler(async (req, res) => {
     }
   }
 
-  res.json({ success: true, data: lecture });
+  res.json({ success: true, data: transformLecture(lecture) });
 });
 
 // @desc Create lecture
@@ -146,7 +168,7 @@ export const createLecture = asyncHandler(async (req, res) => {
   course.totalLectures = await Lecture.countDocuments({ course: courseId });
   await course.save();
 
-  res.status(201).json({ success: true, data: lecture });
+  res.status(201).json({ success: true, data: transformLecture(lecture) });
 });
 
 // @desc Update lecture
@@ -177,7 +199,7 @@ export const updateLecture = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: lecture
+    data: transformLecture(lecture)
   });
 });
 
@@ -219,7 +241,7 @@ export const uploadLectureVideo = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: { videoUrl: lecture.content.videoUrl }
+    data: { videoUrl: getFullImageUrl(lecture.content.videoUrl) }
   });
 });
 
@@ -305,7 +327,7 @@ export const addArticleContent = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: lecture
+    data: transformLecture(lecture)
   });
 });
 
@@ -342,7 +364,7 @@ export const addQuiz = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: lecture
+    data: transformLecture(lecture)
   });
 });
 
@@ -485,9 +507,17 @@ export const addResources = asyncHandler(async (req, res) => {
   lecture.resources.push(...newResources);
   await lecture.save();
 
+  const resourcesWithFullUrls = lecture.resources.map(r => {
+    const obj = r.toObject ? r.toObject() : r;
+    return {
+      ...obj,
+      url: getFullImageUrl(obj.url)
+    };
+  });
+
   res.json({
     success: true,
-    data: lecture.resources
+    data: resourcesWithFullUrls
   });
 });
 
@@ -495,15 +525,15 @@ export const addResources = asyncHandler(async (req, res) => {
 // @route PUT /api/lectures/:id/zoom
 // @access Private/Instructor
 export const addZoomMeeting = asyncHandler(async (req, res) => {
-  const { 
-    meetingUrl, 
-    meetingId, 
-    password, 
-    scheduledAt, 
-    duration, 
+  const {
+    meetingUrl,
+    meetingId,
+    password,
+    scheduledAt,
+    duration,
     topic,
     isRecurring,
-    recurringSchedule 
+    recurringSchedule
   } = req.body;
 
   if (!meetingUrl) {
@@ -544,7 +574,7 @@ export const addZoomMeeting = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: lecture
+    data: transformLecture(lecture)
   });
 });
 
@@ -552,11 +582,11 @@ export const addZoomMeeting = asyncHandler(async (req, res) => {
 // @route PUT /api/lectures/:id/interactive
 // @access Private/Instructor
 export const addInteractiveContent = asyncHandler(async (req, res) => {
-  const { 
-    instructions, 
-    initialCode, 
-    solution, 
-    codeType 
+  const {
+    instructions,
+    initialCode,
+    solution,
+    codeType
   } = req.body;
 
   const lecture = await Lecture.findById(req.params.id)
@@ -595,7 +625,7 @@ export const addInteractiveContent = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: lecture
+    data: transformLecture(lecture)
   });
 });
 
@@ -603,11 +633,11 @@ export const addInteractiveContent = asyncHandler(async (req, res) => {
 // @route PUT /api/lectures/:id/watch-settings
 // @access Private/Instructor
 export const updateWatchSettings = asyncHandler(async (req, res) => {
-  const { 
-    maxWatches, 
-    allowRewind, 
-    allowSpeedChange, 
-    trackWatchTime 
+  const {
+    maxWatches,
+    allowRewind,
+    allowSpeedChange,
+    trackWatchTime
   } = req.body;
 
   const lecture = await Lecture.findById(req.params.id)
@@ -646,42 +676,37 @@ export const addLessonContent = async (req, res) => {
     const { sections } = req.body;
 
     const lecture = await Lecture.findById(id);
-    
+
     if (!lecture) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Lecture not found' 
+      return res.status(404).json({
+        success: false,
+        message: 'Lecture not found'
       });
     }
 
-    // Verify ownership through course
     const course = await Course.findById(lecture.course);
     if (!course) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Course not found' 
+      return res.status(404).json({
+        success: false,
+        message: 'Course not found'
       });
     }
 
-    // Check if user is the instructor of the course or admin
     if (course.instructor.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({ 
-        success: false, 
-        message: 'Not authorized to update this lecture' 
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to update this lecture'
       });
     }
 
-    // Initialize content if it doesn't exist
     if (!lecture.content) {
       lecture.content = {};
     }
 
-    // Set the lesson content
     lecture.content.lesson = {
       sections: sections || []
     };
 
-    // Calculate estimated duration based on content
     const estimatedDuration = calculateLessonDuration(sections);
     if (!lecture.duration || lecture.duration === 0) {
       lecture.duration = estimatedDuration;
@@ -692,25 +717,20 @@ export const addLessonContent = async (req, res) => {
     res.status(200).json({
       success: true,
       message: 'Lesson content added successfully',
-      data: lecture
+      data: transformLecture(lecture)
     });
-
   } catch (error) {
     console.error('Error adding lesson content:', error);
-    res.status(500).json({ 
-      success: false, 
+    res.status(500).json({
+      success: false,
       message: 'Failed to add lesson content',
-      error: error.message 
+      error: error.message
     });
   }
 };
 
-/**
- * Helper function to calculate estimated reading time for lesson
- */
 const calculateLessonDuration = (sections) => {
   if (!sections || !Array.isArray(sections)) return 5;
-
   let wordCount = 0;
   let codeExamples = 0;
 
@@ -741,10 +761,8 @@ const calculateLessonDuration = (sections) => {
     }
   });
 
-  // Average reading speed: 200 words per minute
-  // Code examples add 2 minutes each for understanding
   const readingTime = Math.ceil(wordCount / 200);
   const codeTime = codeExamples * 2;
 
-  return Math.max(5, readingTime + codeTime); // Minimum 5 minutes
+  return Math.max(5, readingTime + codeTime);
 };

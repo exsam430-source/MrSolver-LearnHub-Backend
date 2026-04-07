@@ -6,14 +6,33 @@ import Course from '../models/Course.js';
 import User from '../models/User.js';
 import { paginate, buildPaginationResponse } from '../utils/helpers.js';
 import { sendPaymentStatusEmail, sendEnrollmentConfirmation } from '../utils/emailService.js';
+import { getFullImageUrl } from '../utils/imageHelper.js';
 
-// @desc    Submit payment proof
-// @route   POST /api/payments
-// @access  Private
+// Helper to transform payment
+const transformPayment = (payment) => {
+  if (!payment) return payment;
+  const obj = payment.toObject ? payment.toObject() : payment;
+  return {
+    ...obj,
+    screenshot: getFullImageUrl(obj.screenshot),
+    additionalScreenshots: obj.additionalScreenshots?.map(getFullImageUrl) || [],
+    course: obj.course ? {
+      ...obj.course,
+      thumbnail: getFullImageUrl(obj.course.thumbnail)
+    } : obj.course,
+    student: obj.student ? {
+      ...obj.student,
+      avatar: getFullImageUrl(obj.student.avatar)
+    } : obj.student
+  };
+};
+
+// @desc Submit payment proof
+// @route POST /api/payments
+// @access Private
 export const submitPayment = asyncHandler(async (req, res) => {
   const { courseId } = req.body;
 
-  // Check if screenshot is uploaded
   if (!req.files || !req.files.screenshot) {
     res.status(400);
     throw new Error('Payment screenshot is required');
@@ -31,7 +50,6 @@ export const submitPayment = asyncHandler(async (req, res) => {
     throw new Error('Course is not available');
   }
 
-  // Check for existing pending/active enrollment
   const existingEnrollment = await Enrollment.findOne({
     student: req.user._id,
     course: courseId,
@@ -48,7 +66,6 @@ export const submitPayment = asyncHandler(async (req, res) => {
     }
   }
 
-  // Create enrollment
   const enrollment = await Enrollment.create({
     student: req.user._id,
     course: courseId,
@@ -56,13 +73,11 @@ export const submitPayment = asyncHandler(async (req, res) => {
     paymentStatus: 'pending'
   });
 
-  // Process screenshots
   const screenshotPath = `payments/${req.files.screenshot[0].filename}`;
   const additionalScreenshotPaths = req.files.additionalScreenshots
     ? req.files.additionalScreenshots.map(f => `payments/${f.filename}`)
     : [];
 
-  // Create payment record
   const payment = await Payment.create({
     student: req.user._id,
     course: courseId,
@@ -74,23 +89,22 @@ export const submitPayment = asyncHandler(async (req, res) => {
     status: 'pending'
   });
 
-  // Update enrollment with payment reference
   enrollment.payment = payment._id;
   await enrollment.save();
 
   res.status(201).json({
     success: true,
     data: {
-      payment,
+      payment: transformPayment(payment),
       enrollment
     },
     message: 'Payment submitted successfully. Please wait for verification.'
   });
 });
 
-// @desc    Get my payments
-// @route   GET /api/payments/my-payments
-// @access  Private
+// @desc Get my payments
+// @route GET /api/payments/my-payments
+// @access Private
 export const getMyPayments = asyncHandler(async (req, res) => {
   const { page, limit, skip } = paginate(req.query.page, req.query.limit);
   const { status } = req.query;
@@ -110,17 +124,17 @@ export const getMyPayments = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: payments,
+    data: payments.map(transformPayment),
     pagination: buildPaginationResponse(total, page, limit)
   });
 });
 
-// @desc    Get payment details
-// @route   GET /api/payments/:id
-// @access  Private
+// @desc Get payment details
+// @route GET /api/payments/:id
+// @access Private
 export const getPayment = asyncHandler(async (req, res) => {
   const payment = await Payment.findById(req.params.id)
-    .populate('student', 'firstName lastName email phone')
+    .populate('student', 'firstName lastName email phone avatar')
     .populate('course', 'title slug price thumbnail')
     .populate('enrollment')
     .populate('reviewedBy', 'firstName lastName');
@@ -130,7 +144,6 @@ export const getPayment = asyncHandler(async (req, res) => {
     throw new Error('Payment not found');
   }
 
-  // Check ownership or admin
   if (
     payment.student._id.toString() !== req.user._id.toString() &&
     req.user.role !== 'admin'
@@ -141,13 +154,13 @@ export const getPayment = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: payment
+    data: transformPayment(payment)
   });
 });
 
-// @desc    Get all payments (Admin)
-// @route   GET /api/payments/admin/all
-// @access  Private/Admin
+// @desc Get all payments (Admin)
+// @route GET /api/payments/admin/all
+// @access Private/Admin
 export const getAllPayments = asyncHandler(async (req, res) => {
   const { page, limit, skip } = paginate(req.query.page, req.query.limit);
   const { status, startDate, endDate, search } = req.query;
@@ -166,13 +179,12 @@ export const getAllPayments = asyncHandler(async (req, res) => {
 
   const total = await Payment.countDocuments(query);
   let payments = await Payment.find(query)
-    .populate('student', 'firstName lastName email phone')
-    .populate('course', 'title slug price')
+    .populate('student', 'firstName lastName email phone avatar')
+    .populate('course', 'title slug price thumbnail')
     .sort({ createdAt: -1 })
     .skip(skip)
     .limit(limit);
 
-  // Filter by search (in-memory)
   if (search) {
     const s = search.toLowerCase();
     payments = payments.filter(p =>
@@ -186,14 +198,14 @@ export const getAllPayments = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: payments,
+    data: payments.map(transformPayment),
     pagination: buildPaginationResponse(total, page, limit)
   });
 });
 
-// @desc    Review payment (Approve/Reject)
-// @route   PUT /api/payments/:id/review
-// @access  Private/Admin
+// @desc Review payment (Approve/Reject)
+// @route PUT /api/payments/:id/review
+// @access Private/Admin
 export const reviewPayment = asyncHandler(async (req, res) => {
   const { status, reviewNotes, rejectionReason } = req.body;
 
@@ -216,7 +228,6 @@ export const reviewPayment = asyncHandler(async (req, res) => {
     throw new Error('Payment has already been processed');
   }
 
-  // Update payment
   payment.status = status;
   payment.reviewedBy = req.user._id;
   payment.reviewedAt = new Date();
@@ -228,7 +239,6 @@ export const reviewPayment = asyncHandler(async (req, res) => {
 
   await payment.save();
 
-  // Update enrollment
   const enrollment = await Enrollment.findById(payment.enrollment);
 
   if (status === 'approved') {
@@ -263,14 +273,14 @@ export const reviewPayment = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: payment,
+    data: transformPayment(payment),
     message: `Payment ${status} successfully`
   });
 });
 
-// @desc    Get payment statistics (Admin)
-// @route   GET /api/payments/stats
-// @access  Private/Admin
+// @desc Get payment statistics (Admin)
+// @route GET /api/payments/stats
+// @access Private/Admin
 export const getPaymentStats = asyncHandler(async (req, res) => {
   const totalPayments = await Payment.countDocuments();
   const pendingPayments = await Payment.countDocuments({ status: 'pending' });
@@ -311,9 +321,9 @@ export const getPaymentStats = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Mark payment as under review
-// @route   PATCH /api/payments/:id/under-review
-// @access  Private/Admin
+// @desc Mark payment as under review
+// @route PATCH /api/payments/:id/under-review
+// @access Private/Admin
 export const markUnderReview = asyncHandler(async (req, res) => {
   const payment = await Payment.findById(req.params.id);
 
@@ -332,6 +342,6 @@ export const markUnderReview = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: payment
+    data: transformPayment(payment)
   });
 });
