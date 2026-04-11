@@ -465,6 +465,9 @@ export const getCertificate = asyncHandler(async (req, res) => {
 // @desc Download certificate PDF
 // @route GET /api/certificates/:id/download
 // @access Private
+// @desc Download certificate PDF
+// @route GET /api/certificates/:id/download
+// @access Private
 export const downloadCertificate = asyncHandler(async (req, res) => {
   const certificate = await Certificate.findById(req.params.id);
 
@@ -487,19 +490,79 @@ export const downloadCertificate = asyncHandler(async (req, res) => {
     throw new Error('This certificate is no longer valid');
   }
 
-  const filePath = path.join(__dirname, '..', 'uploads', certificate.certificateUrl);
+  // ✅ FIXED: Handle the certificateUrl path correctly
+  let certificateUrl = certificate.certificateUrl;
+
+  // Remove any URL prefix if getFullImageUrl was applied
+  if (certificateUrl.startsWith('http')) {
+    // Extract just the path part
+    try {
+      const url = new URL(certificateUrl);
+      certificateUrl = url.pathname.replace('/uploads/', '');
+    } catch (e) {
+      // If URL parsing fails, try to extract path manually
+      const uploadsIndex = certificateUrl.indexOf('/uploads/');
+      if (uploadsIndex !== -1) {
+        certificateUrl = certificateUrl.substring(uploadsIndex + '/uploads/'.length);
+      }
+    }
+  }
+
+  // Remove leading slash
+  if (certificateUrl.startsWith('/')) {
+    certificateUrl = certificateUrl.substring(1);
+  }
+
+  const filePath = path.join(__dirname, '..', 'uploads', certificateUrl);
+
+  console.log('Certificate download:', {
+    originalUrl: certificate.certificateUrl,
+    cleanedUrl: certificateUrl,
+    filePath,
+    exists: fs.existsSync(filePath)
+  });
 
   if (!fs.existsSync(filePath)) {
     res.status(404);
-    throw new Error('Certificate file not found');
+    throw new Error(
+      `Certificate file not found. Path: ${certificateUrl}. ` +
+      'The file may have been deleted during a server redeploy. ' +
+      'Please contact the instructor to reissue the certificate.'
+    );
   }
 
-  await certificate.trackDownload();
+  // ✅ Track download
+  try {
+    await certificate.trackDownload();
+  } catch (e) {
+    console.error('Track download error:', e);
+  }
+
+  // ✅ FIXED: Set proper headers for PDF download
+  const stat = fs.statSync(filePath);
 
   res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="Certificate-${certificate.certificateNumber}.pdf"`);
+  res.setHeader('Content-Length', stat.size);
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="Certificate-${certificate.certificateNumber}.pdf"`
+  );
+
+  // ✅ Prevent any other middleware from modifying the response
+  res.setHeader('Cache-Control', 'no-cache');
 
   const fileStream = fs.createReadStream(filePath);
+
+  fileStream.on('error', (err) => {
+    console.error('File stream error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: 'Error reading certificate file',
+      });
+    }
+  });
+
   fileStream.pipe(res);
 });
 
