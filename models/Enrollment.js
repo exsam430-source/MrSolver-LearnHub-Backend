@@ -1,16 +1,16 @@
 // models/Enrollment.js
 import mongoose from 'mongoose';
 
-// Sub-schema for detailed watch progress per lecture
+// ✅ Sub-schema for lecture progress
 const lectureProgressSchema = new mongoose.Schema({
   lecture: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Lecture',
     required: true
   },
-  watchCount: { type: Number, default: 0 },
-  totalWatchTime: { type: Number, default: 0 },
-  lastPosition: { type: Number, default: 0 },
+  watchCount: { type: Number, default: 0, min: 0 },
+  totalWatchTime: { type: Number, default: 0, min: 0 },
+  lastPosition: { type: Number, default: 0, min: 0 },
   lastWatchedAt: Date,
   isCompleted: { type: Boolean, default: false },
   completedAt: Date,
@@ -26,10 +26,13 @@ const lectureProgressSchema = new mongoose.Schema({
     timeTaken: Number,
     passed: Boolean
   }],
-  personalNotes: { type: String, maxLength: 5000 }
+  personalNotes: {
+    type: String,
+    maxLength: [5000, 'Notes cannot exceed 5000 characters']
+  }
 }, { _id: false });
 
-// Sub-schema for code submissions
+// ✅ Code submission schema
 const codeSubmissionSchema = new mongoose.Schema({
   lecture: {
     type: mongoose.Schema.Types.ObjectId,
@@ -50,7 +53,7 @@ const codeSubmissionSchema = new mongoose.Schema({
   }
 }, { _id: true });
 
-// Sub-schema for Zoom attendance
+// ✅ Zoom attendance schema
 const zoomAttendanceSchema = new mongoose.Schema({
   lecture: {
     type: mongoose.Schema.Types.ObjectId,
@@ -63,14 +66,17 @@ const zoomAttendanceSchema = new mongoose.Schema({
   attended: { type: Boolean, default: false }
 }, { _id: false });
 
-// Sub-schema for bookmarks
+// ✅ Bookmark schema
 const bookmarkSchema = new mongoose.Schema({
   lecture: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Lecture'
   },
-  timestamp: Number,
-  note: String,
+  timestamp: { type: Number, min: 0 },
+  note: {
+    type: String,
+    maxLength: [500, 'Bookmark note cannot exceed 500 characters']
+  },
   createdAt: { type: Date, default: Date.now }
 }, { _id: true });
 
@@ -78,12 +84,14 @@ const enrollmentSchema = new mongoose.Schema({
   student: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    required: true
+    required: true,
+    index: true
   },
   course: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Course',
-    required: true
+    required: true,
+    index: true
   },
   enrollmentDate: {
     type: Date,
@@ -91,12 +99,19 @@ const enrollmentSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['pending', 'active', 'completed', 'expired', 'cancelled'],
-    default: 'pending'
+    enum: {
+      values: ['pending', 'active', 'completed', 'expired', 'cancelled'],
+      message: 'Invalid enrollment status'
+    },
+    default: 'pending',
+    index: true
   },
   paymentStatus: {
     type: String,
-    enum: ['pending', 'paid', 'failed', 'refunded'],
+    enum: {
+      values: ['pending', 'paid', 'failed', 'refunded'],
+      message: 'Invalid payment status'
+    },
     default: 'pending'
   },
   payment: {
@@ -104,7 +119,7 @@ const enrollmentSchema = new mongoose.Schema({
     ref: 'Payment'
   },
 
-  // Legacy progress (keep for backward compatibility)
+  // ✅ Progress tracking
   progress: {
     completedLectures: [{
       type: mongoose.Schema.Types.ObjectId,
@@ -116,34 +131,29 @@ const enrollmentSchema = new mongoose.Schema({
     },
     percentage: {
       type: Number,
-      default: 0
+      default: 0,
+      min: 0,
+      max: 100
     },
     lastAccessed: Date
   },
 
-  // Detailed lecture progress with watch tracking
   lectureProgress: [lectureProgressSchema],
-
-  // Code submissions for interactive lectures
   codeSubmissions: [codeSubmissionSchema],
-
-  // Zoom meeting attendance
   zoomAttendance: [zoomAttendanceSchema],
-
-  // Video bookmarks
   bookmarks: [bookmarkSchema],
 
-  // Overall statistics
+  // ✅ Stats
   stats: {
-    totalWatchTime: { type: Number, default: 0 },
-    totalTimeSpent: { type: Number, default: 0 },
+    totalWatchTime: { type: Number, default: 0, min: 0 },
+    totalTimeSpent: { type: Number, default: 0, min: 0 },
     averageQuizScore: { type: Number, default: 0 },
     lastActivityAt: Date,
-    streakDays: { type: Number, default: 0 },
-    longestStreak: { type: Number, default: 0 }
+    streakDays: { type: Number, default: 0, min: 0 },
+    longestStreak: { type: Number, default: 0, min: 0 }
   },
 
-  // ✅ NEW: Certificate fields
+  // ✅ Certificate fields
   certificateIssued: {
     type: Boolean,
     default: false
@@ -152,28 +162,49 @@ const enrollmentSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Certificate'
   },
-  certificateUrl: {
-    type: String
+  certificateUrl: String,
+  certificateIssuedAt: Date,
+
+  // ✅ Subscription tracking (NEW)
+  subscriptionExpiry: {
+    type: Date,
+    index: true
   },
-  certificateIssuedAt: {
-    type: Date
+  subscriptionMonthsPaid: {
+    type: Number,
+    default: 0,
+    min: 0
   },
+  isPermanentlyUnlocked: {
+    type: Boolean,
+    default: false
+  },
+  lastSubscriptionPayment: Date,
 
   completedAt: Date,
   expiresAt: Date,
-  notes: String
+  notes: {
+    type: String,
+    maxLength: [1000, 'Notes cannot exceed 1000 characters']
+  }
 }, {
   timestamps: true
 });
 
-// Indexes
+// =============================================
+// INDEXES
+// =============================================
 enrollmentSchema.index({ student: 1, course: 1 }, { unique: true });
 enrollmentSchema.index({ course: 1, status: 1 });
 enrollmentSchema.index({ student: 1, status: 1 });
-enrollmentSchema.index({ 'lectureProgress.lecture': 1 });
 enrollmentSchema.index({ certificateId: 1 });
+enrollmentSchema.index({ subscriptionExpiry: 1, status: 1 });
+enrollmentSchema.index({ createdAt: -1 });
 
-// Methods
+// =============================================
+// METHODS
+// =============================================
+
 enrollmentSchema.methods.getLectureProgress = function(lectureId) {
   return this.lectureProgress.find(
     p => p.lecture.toString() === lectureId.toString()
@@ -182,16 +213,17 @@ enrollmentSchema.methods.getLectureProgress = function(lectureId) {
 
 enrollmentSchema.methods.isLectureCompleted = function(lectureId) {
   const progress = this.getLectureProgress(lectureId);
-  return progress?.isCompleted || this.progress.completedLectures.some(
-    id => id.toString() === lectureId.toString()
-  );
+  return progress?.isCompleted ||
+    this.progress.completedLectures.some(
+      id => id.toString() === lectureId.toString()
+    );
 };
 
 enrollmentSchema.methods.calculateProgress = function(totalLectures) {
   if (!totalLectures || totalLectures <= 0) return 0;
-  const completedFromLectureProgress = this.lectureProgress.filter(p => p.isCompleted).length;
-  const completedFromLegacy = this.progress.completedLectures.length;
-  const completed = Math.max(completedFromLectureProgress, completedFromLegacy);
+  const fromDetailed = this.lectureProgress.filter(p => p.isCompleted).length;
+  const fromLegacy = this.progress.completedLectures.length;
+  const completed = Math.max(fromDetailed, fromLegacy);
   return Math.round((completed / totalLectures) * 100);
 };
 
@@ -202,12 +234,14 @@ enrollmentSchema.methods.updateStreak = function() {
   if (!lastActivity) {
     this.stats.streakDays = 1;
   } else {
-    const diffDays = Math.floor((now - lastActivity) / (1000 * 60 * 60 * 24));
+    const diffDays = Math.floor(
+      (now - lastActivity) / (1000 * 60 * 60 * 24)
+    );
     if (diffDays === 0) {
-      // Same day
+      // Same day - no change
     } else if (diffDays === 1) {
       this.stats.streakDays = (this.stats.streakDays || 0) + 1;
-      if (this.stats.streakDays > this.stats.longestStreak) {
+      if (this.stats.streakDays > (this.stats.longestStreak || 0)) {
         this.stats.longestStreak = this.stats.streakDays;
       }
     } else {
@@ -217,16 +251,27 @@ enrollmentSchema.methods.updateStreak = function() {
   this.stats.lastActivityAt = now;
 };
 
-// Pre-save middleware to sync progress
+// ✅ Check if subscription is still active
+enrollmentSchema.methods.isSubscriptionActive = function() {
+  if (this.isPermanentlyUnlocked) return true;
+  if (!this.subscriptionExpiry) return false;
+  return new Date(this.subscriptionExpiry) > new Date();
+};
+
+// =============================================
+// PRE-SAVE HOOKS
+// =============================================
 enrollmentSchema.pre('save', function() {
   if (this.isModified('lectureProgress')) {
-    const completedLectureIds = this.lectureProgress
+    const completedIds = this.lectureProgress
       .filter(p => p.isCompleted)
       .map(p => p.lecture);
 
-    // Merge with existing completed lectures
-    const existingIds = this.progress.completedLectures.map(id => id.toString());
-    completedLectureIds.forEach(id => {
+    const existingIds = this.progress.completedLectures.map(
+      id => id.toString()
+    );
+
+    completedIds.forEach(id => {
       if (!existingIds.includes(id.toString())) {
         this.progress.completedLectures.push(id);
       }

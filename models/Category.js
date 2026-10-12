@@ -1,3 +1,4 @@
+// models/Category.js
 import mongoose from 'mongoose';
 import slugify from 'slugify';
 
@@ -12,16 +13,24 @@ const categorySchema = new mongoose.Schema({
   slug: {
     type: String,
     unique: true,
-    sparse: true
+    sparse: true,
+    index: true
   },
   description: {
     type: String,
-    maxLength: [500, 'Description cannot exceed 500 characters']
+    maxLength: [500, 'Description cannot exceed 500 characters'],
+    trim: true
   },
-  icon: { type: String, default: 'categories/default-category.png' },
+  icon: {
+    type: String,
+    default: 'code',
+    trim: true,
+    maxLength: [50, 'Icon cannot exceed 50 characters']
+  },
   color: {
     type: String,
-    default: '#3B82F6'
+    default: '#3B82F6',
+    match: [/^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$/, 'Please provide a valid hex color']
   },
   parent: {
     type: mongoose.Schema.Types.ObjectId,
@@ -30,11 +39,13 @@ const categorySchema = new mongoose.Schema({
   },
   isActive: {
     type: Boolean,
-    default: true
+    default: true,
+    index: true
   },
   order: {
     type: Number,
-    default: 0
+    default: 0,
+    min: 0
   }
 }, {
   timestamps: true,
@@ -42,7 +53,16 @@ const categorySchema = new mongoose.Schema({
   toObject: { virtuals: true }
 });
 
-// Virtual for courses count
+// =============================================
+// INDEXES
+// =============================================
+categorySchema.index({ name: 1 });
+categorySchema.index({ isActive: 1, order: 1 });
+categorySchema.index({ createdAt: -1 });
+
+// =============================================
+// VIRTUAL
+// =============================================
 categorySchema.virtual('coursesCount', {
   ref: 'Course',
   localField: '_id',
@@ -50,17 +70,39 @@ categorySchema.virtual('coursesCount', {
   count: true
 });
 
-// Generate slug before saving - NO next() for Mongoose 8.x
-categorySchema.pre('save', function() {
+// =============================================
+// PRE-SAVE HOOKS
+// =============================================
+
+// ✅ Generate slug from name
+categorySchema.pre('save', function () {
   if (this.isModified('name') || !this.slug) {
-    this.slug = slugify(this.name, { lower: true, strict: true });
+    this.slug = slugify(this.name, {
+      lower: true,
+      strict: true,
+      trim: true
+    });
   }
 });
 
-// Generate slug before validation - NO next() for Mongoose 8.x
-categorySchema.pre('validate', function() {
+// ✅ Generate slug before validation
+categorySchema.pre('validate', function () {
   if (this.name && !this.slug) {
-    this.slug = slugify(this.name, { lower: true, strict: true });
+    this.slug = slugify(this.name, {
+      lower: true,
+      strict: true,
+      trim: true
+    });
+  }
+});
+
+// ✅ Sanitize name - strip HTML tags
+categorySchema.pre('save', function () {
+  if (this.isModified('name') && this.name) {
+    this.name = this.name.replace(/<[^>]*>/g, '').trim();
+  }
+  if (this.isModified('description') && this.description) {
+    this.description = this.description.replace(/<[^>]*>/g, '').trim();
   }
 });
 

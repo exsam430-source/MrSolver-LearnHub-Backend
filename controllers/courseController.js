@@ -8,47 +8,76 @@ import Enrollment from '../models/Enrollment.js';
 import User from '../models/User.js';
 import { paginate, buildPaginationResponse } from '../utils/helpers.js';
 import { getFullImageUrl } from '../utils/imageHelper.js';
+import { securityLog } from '../middleware/auditLog.js';
 
-// Helper to transform course
+// =============================================
+// HELPERS
+// =============================================
+
+// ✅ Safe transform course (no sensitive data)
 const transformCourse = (course) => {
-  if (!course) return course;
+  if (!course) return null;
   const obj = course.toObject ? course.toObject() : course;
+
   return {
     ...obj,
     thumbnail: getFullImageUrl(obj.thumbnail),
-    certificateTemplate: getFullImageUrl(obj.certificateTemplate),
-    instructor: obj.instructor ? {
-      ...obj.instructor,
-      avatar: getFullImageUrl(obj.instructor.avatar)
-    } : obj.instructor
+    certificateTemplate: obj.certificateTemplate
+      ? getFullImageUrl(obj.certificateTemplate)
+      : null,
+    instructor: obj.instructor
+      ? {
+          ...obj.instructor,
+          avatar: getFullImageUrl(obj.instructor.avatar)
+        }
+      : obj.instructor
   };
 };
 
-// Helper function to get category ID from slug or ID
+// ✅ Validate ObjectId
+const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
+
+// ✅ Escape regex special chars (prevent ReDoS)
+const escapeRegex = (str) =>
+  str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// ✅ Get category ID from slug or ObjectId
 const getCategoryId = async (categoryParam) => {
   if (!categoryParam || categoryParam === '' || categoryParam === 'all') {
     return null;
   }
 
-  if (mongoose.Types.ObjectId.isValid(categoryParam)) {
-    return categoryParam;
+  if (isValidId(categoryParam)) {
+    return new mongoose.Types.ObjectId(categoryParam);
   }
 
+  const escaped = escapeRegex(categoryParam);
   const category = await Category.findOne({
     $or: [
       { slug: categoryParam.toLowerCase() },
-      { name: { $regex: new RegExp(`^${categoryParam}$`, 'i') } }
+      { name: { $regex: new RegExp(`^${escaped}$`, 'i') } }
     ]
-  });
+  }).select('_id').lean();
 
   return category ? category._id : null;
 };
 
-// @desc Get all published courses
-// @route GET /api/courses
-// @access Public
+// ✅ Check course ownership
+const checkOwnership = (course, user) => {
+  if (user.role === 'admin') return true;
+  const instructorId = course.instructor?._id || course.instructor;
+  return instructorId?.toString() === user._id.toString();
+};
+
+// =============================================
+// PUBLIC: GET ALL COURSES
+// =============================================
 export const getCourses = asyncHandler(async (req, res) => {
-  const { page, limit, skip } = paginate(req.query.page, req.query.limit);
+  const { page, limit, skip } = paginate(
+    req.query.page,
+    Math.min(req.query.limit || 12, 50) // ✅ Max 50 per page
+  );
+
   const {
     search,
     category,
@@ -60,15 +89,18 @@ export const getCourses = asyncHandler(async (req, res) => {
 
   const query = { isPublished: true };
 
-  if (search && search.trim() !== '') {
+  // ✅ Safe search with escaped regex
+  if (search && search.trim()) {
+    const escaped = escapeRegex(search.trim());
+    const searchRegex = new RegExp(escaped, 'i');
     query.$or = [
-      { title: { $regex: search, $options: 'i' } },
-      { description: { $regex: search, $options: 'i' } },
-      { tags: { $regex: search, $options: 'i' } }
+      { title: searchRegex },
+      { tags: searchRegex }
     ];
   }
 
-  if (category && category !== '' && category !== 'all') {
+  // ✅ Category filter
+  if (category && category !== 'all' && category !== '') {
     const categoryId = await getCategoryId(category);
     if (categoryId) {
       query.category = categoryId;
@@ -81,89 +113,105 @@ export const getCourses = asyncHandler(async (req, res) => {
     }
   }
 
+  // ✅ Level filter (whitelist)
   if (level && level !== 'all' && level !== '') {
-    query.level = level;
+    const validLevels = ['beginner', 'intermediate', 'advanced', 'all-levels'];
+    if (validLevels.includes(level)) {
+      query.level = level;
+    }
   }
 
+  // ✅ Price filter
   if (price === 'free') {
-    if (!search) {
-      query.$or = [{ isFreeCourse: true }, { price: 0 }];
-    } else {
-      query.isFreeCourse = true;
-    }
+    query.$or = query.$or
+      ? [{ $and: [{ $or: query.$or }, { $or: [{ isFreeCourse: true }, { price: 0 }] }] }]
+      : [{ isFreeCourse: true }, { price: 0 }];
+    query.pricingType = 'free';
   } else if (price === 'paid') {
     query.isFreeCourse = { $ne: true };
     query.price = { $gt: 0 };
   }
 
-  if (instructor) {
-    if (mongoose.Types.ObjectId.isValid(instructor)) {
-      query.instructor = instructor;
-    }
+  // ✅ Instructor filter
+  if (instructor && isValidId(instructor)) {
+    query.instructor = new mongoose.Types.ObjectId(instructor);
   }
 
-  let sortOptions = {};
-  switch (sort) {
-    case 'newest':
-      sortOptions = { createdAt: -1 };
-      break;
-    case 'oldest':
-      sortOptions = { createdAt: 1 };
-      break;
-    case 'price-low':
-      sortOptions = { price: 1 };
-      break;
-    case 'price-high':
-      sortOptions = { price: -1 };
-      break;
-    case 'rating':
-      sortOptions = { 'rating.average': -1 };
-      break;
-    case 'popular':
-      sortOptions = { enrollmentCount: -1 };
-      break;
-    default:
-      sortOptions = { createdAt: -1 };
-  }
+  // ✅ Sort options (whitelist)
+  const sortMap = {
+    newest: { createdAt: -1 },
+    oldest: { createdAt: 1 },
+    'price-low': { price: 1 },
+    'price-high': { price: -1 },
+    rating: { 'rating.average': -1 },
+    popular: { enrollmentCount: -1 }
+  };
+  const sortOptions = sortMap[sort] || sortMap.newest;
 
-  const total = await Course.countDocuments(query);
-  const courses = await Course.find(query)
-    .populate('instructor', 'firstName lastName avatar')
-    .populate('category', 'name slug')
-    .select('-curriculum')
-    .sort(sortOptions)
-    .skip(skip)
-    .limit(limit);
+  const [total, courses] = await Promise.all([
+    Course.countDocuments(query),
+    Course.find(query)
+      .populate('instructor', 'firstName lastName avatar')
+      .populate('category', 'name slug')
+      .select('-curriculum -certificateSettings -certificateTemplate')
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(limit)
+      .lean()
+  ]);
 
   res.json({
     success: true,
-    data: courses.map(transformCourse),
+    data: courses.map((c) => ({
+      ...c,
+      thumbnail: getFullImageUrl(c.thumbnail),
+      instructor: c.instructor
+        ? { ...c.instructor, avatar: getFullImageUrl(c.instructor.avatar) }
+        : null
+    })),
     pagination: buildPaginationResponse(total, page, limit)
   });
 });
 
-// @desc Get featured courses
-// @route GET /api/courses/featured
-// @access Public
+// =============================================
+// PUBLIC: GET FEATURED COURSES
+// =============================================
 export const getFeaturedCourses = asyncHandler(async (req, res) => {
-  const courses = await Course.find({ isPublished: true, isFeatured: true })
+  const courses = await Course.find({
+    isPublished: true,
+    isFeatured: true
+  })
     .populate('instructor', 'firstName lastName avatar')
     .populate('category', 'name slug')
-    .select('-curriculum')
+    .select('-curriculum -certificateSettings')
     .limit(8)
-    .sort({ enrollmentCount: -1 });
+    .sort({ enrollmentCount: -1 })
+    .lean();
 
   res.json({
     success: true,
-    data: courses.map(transformCourse)
+    data: courses.map((c) => ({
+      ...c,
+      thumbnail: getFullImageUrl(c.thumbnail),
+      instructor: c.instructor
+        ? { ...c.instructor, avatar: getFullImageUrl(c.instructor.avatar) }
+        : null
+    }))
   });
 });
 
-// @desc Get single course by slug
-// @route GET /api/courses/:slug
-// @access Public
+// =============================================
+// PUBLIC: GET COURSE BY SLUG
+// =============================================
 export const getCourseBySlug = asyncHandler(async (req, res) => {
-  const course = await Course.findOne({ slug: req.params.slug })
+  // ✅ Validate slug format
+  const slug = req.params.slug;
+  if (!slug || slug.length > 300) {
+    res.status(400);
+    throw new Error('Invalid course slug');
+  }
+
+  const course = await Course.findOne({ slug })
     .populate('instructor', 'firstName lastName avatar bio socialLinks')
     .populate('category', 'name slug')
     .populate({
@@ -176,13 +224,14 @@ export const getCourseBySlug = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
+  // ✅ Check enrollment status
   let isEnrolled = false;
   if (req.user) {
     const enrollment = await Enrollment.findOne({
       student: req.user._id,
       course: course._id,
       status: { $in: ['active', 'completed'] }
-    });
+    }).select('_id status').lean();
     isEnrolled = !!enrollment;
   }
 
@@ -195,13 +244,13 @@ export const getCourseBySlug = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc Get course by ID
-// @route GET /api/courses/id/:id
-// @access Private/Instructor
+// =============================================
+// PRIVATE: GET COURSE BY ID (Instructor/Admin)
+// =============================================
 export const getCourseById = asyncHandler(async (req, res) => {
-  if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+  if (!isValidId(req.params.id)) {
     res.status(400);
-    throw new Error('Invalid course ID');
+    throw new Error('Invalid course ID format');
   }
 
   const course = await Course.findById(req.params.id)
@@ -217,12 +266,15 @@ export const getCourseById = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  if (
-    req.user.role !== 'admin' &&
-    course.instructor._id.toString() !== req.user._id.toString()
-  ) {
+  // ✅ Ownership check
+  if (!checkOwnership(course, req.user)) {
+    securityLog('UNAUTHORIZED_COURSE_ACCESS', {
+      userId: req.user._id,
+      courseId: course._id,
+      ip: req.ip
+    });
     res.status(403);
-    throw new Error('Not authorized to access this course');
+    throw new Error('You are not authorized to access this course');
   }
 
   res.json({
@@ -231,10 +283,11 @@ export const getCourseById = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc Create course
-// @route POST /api/courses
-// @access Private/Instructor
+// =============================================
+// PRIVATE: CREATE COURSE
+// =============================================
 export const createCourse = asyncHandler(async (req, res) => {
+  // ✅ Validation done by middleware
   const {
     title,
     description,
@@ -242,25 +295,72 @@ export const createCourse = asyncHandler(async (req, res) => {
     category,
     level,
     language,
+    pricingType,
     price,
     discountPrice,
+    isFreeCourse,
+    subscriptionPlans,
     requirements,
     whatYouWillLearn,
     targetAudience,
     tags,
-    isFreeCourse,
     instructorId
   } = req.body;
 
+  // ✅ Validate category exists
+  if (!isValidId(category)) {
+    res.status(400);
+    throw new Error('Invalid category ID');
+  }
+
+  const categoryExists = await Category.findById(category).select('_id').lean();
+  if (!categoryExists) {
+    res.status(400);
+    throw new Error('Category not found');
+  }
+
+  // ✅ Determine instructor
   let instructor = req.user._id;
 
   if (req.user.role === 'admin' && instructorId) {
-    const instructorUser = await User.findById(instructorId);
+    if (!isValidId(instructorId)) {
+      res.status(400);
+      throw new Error('Invalid instructor ID');
+    }
+    const instructorUser = await User.findById(instructorId)
+      .select('role isActive').lean();
     if (!instructorUser || !['instructor', 'admin'].includes(instructorUser.role)) {
       res.status(400);
       throw new Error('Invalid instructor selected');
     }
+    if (!instructorUser.isActive) {
+      res.status(400);
+      throw new Error('Selected instructor account is inactive');
+    }
     instructor = instructorId;
+  }
+
+  // ✅ Price validation
+  if (!isFreeCourse && pricingType !== 'free' && price <= 0 && pricingType === 'one_time') {
+    res.status(400);
+    throw new Error('Price must be greater than 0 for paid courses');
+  }
+
+  if (discountPrice && discountPrice >= price) {
+    res.status(400);
+    throw new Error('Discount price must be less than regular price');
+  }
+
+  // ✅ Subscription validation
+  if (pricingType === 'subscription') {
+    if (!subscriptionPlans?.monthly?.enabled) {
+      res.status(400);
+      throw new Error('Subscription courses must have monthly plan enabled');
+    }
+    if (!subscriptionPlans?.monthly?.price || subscriptionPlans.monthly.price <= 0) {
+      res.status(400);
+      throw new Error('Monthly subscription price must be greater than 0');
+    }
   }
 
   const course = await Course.create({
@@ -270,67 +370,39 @@ export const createCourse = asyncHandler(async (req, res) => {
     category,
     level,
     language,
+    pricingType: isFreeCourse ? 'free' : pricingType,
     price: isFreeCourse ? 0 : price,
-    discountPrice,
-    requirements,
-    whatYouWillLearn,
-    targetAudience,
-    tags,
-    isFreeCourse,
+    discountPrice: discountPrice || undefined,
+    isFreeCourse: isFreeCourse || pricingType === 'free',
+    subscriptionPlans,
+    requirements: requirements || [],
+    whatYouWillLearn: whatYouWillLearn || [],
+    targetAudience: targetAudience || [],
+    tags: tags || [],
     instructor
+  });
+
+  securityLog('COURSE_CREATED', {
+    userId: req.user._id,
+    courseId: course._id,
+    courseTitle: course.title,
+    ip: req.ip
   });
 
   res.status(201).json({
     success: true,
+    message: 'Course created successfully',
     data: transformCourse(course)
   });
 });
 
-// @desc Update course
-// @route PUT /api/courses/:id
-// @access Private/Instructor
+// =============================================
+// PRIVATE: UPDATE COURSE
+// =============================================
 export const updateCourse = asyncHandler(async (req, res) => {
-  let course = await Course.findById(req.params.id);
-
-  if (!course) {
-    res.status(404);
-    throw new Error('Course not found');
-  }
-
-  if (
-    req.user.role !== 'admin' &&
-    course.instructor.toString() !== req.user._id.toString()
-  ) {
-    res.status(403);
-    throw new Error('Not authorized to update this course');
-  }
-
-  if (req.user.role === 'admin' && req.body.instructorId) {
-    const instructorUser = await User.findById(req.body.instructorId);
-    if (instructorUser && ['instructor', 'admin'].includes(instructorUser.role)) {
-      req.body.instructor = req.body.instructorId;
-    }
-  }
-
-  course = await Course.findByIdAndUpdate(
-    req.params.id,
-    req.body,
-    { new: true, runValidators: true }
-  );
-
-  res.json({
-    success: true,
-    data: transformCourse(course)
-  });
-});
-
-// @desc Update course thumbnail
-// @route PUT /api/courses/:id/thumbnail
-// @access Private/Instructor
-export const updateCourseThumbnail = asyncHandler(async (req, res) => {
-  if (!req.file) {
+  if (!isValidId(req.params.id)) {
     res.status(400);
-    throw new Error('Please upload an image');
+    throw new Error('Invalid course ID format');
   }
 
   const course = await Course.findById(req.params.id);
@@ -340,12 +412,130 @@ export const updateCourseThumbnail = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  if (
-    req.user.role !== 'admin' &&
-    course.instructor.toString() !== req.user._id.toString()
-  ) {
+  // ✅ Ownership check
+  if (!checkOwnership(course, req.user)) {
+    securityLog('UNAUTHORIZED_COURSE_UPDATE', {
+      userId: req.user._id,
+      courseId: course._id,
+      ip: req.ip
+    });
     res.status(403);
-    throw new Error('Not authorized');
+    throw new Error('You are not authorized to update this course');
+  }
+
+  // ✅ Validation done by middleware
+  const {
+    title,
+    description,
+    shortDescription,
+    category,
+    level,
+    language,
+    pricingType,
+    price,
+    discountPrice,
+    isFreeCourse,
+    subscriptionPlans,
+    requirements,
+    whatYouWillLearn,
+    targetAudience,
+    tags,
+    instructorId,
+    certificateSettings
+  } = req.body;
+
+  // ✅ Validate category if changing
+  if (category && category !== course.category?.toString()) {
+    if (!isValidId(category)) {
+      res.status(400);
+      throw new Error('Invalid category ID');
+    }
+    const catExists = await Category.findById(category).select('_id').lean();
+    if (!catExists) {
+      res.status(400);
+      throw new Error('Category not found');
+    }
+  }
+
+  // ✅ Admin can change instructor
+  if (req.user.role === 'admin' && instructorId) {
+    if (!isValidId(instructorId)) {
+      res.status(400);
+      throw new Error('Invalid instructor ID');
+    }
+    const instructorUser = await User.findById(instructorId)
+      .select('role isActive').lean();
+    if (instructorUser && ['instructor', 'admin'].includes(instructorUser.role)) {
+      course.instructor = instructorId;
+    }
+  }
+
+  // ✅ Price validation
+  const newPrice = price !== undefined ? price : course.price;
+  const newDiscountPrice = discountPrice !== undefined ? discountPrice : course.discountPrice;
+
+  if (newDiscountPrice && newDiscountPrice >= newPrice) {
+    res.status(400);
+    throw new Error('Discount price must be less than regular price');
+  }
+
+  // ✅ Apply updates (only provided fields)
+  if (title !== undefined) course.title = title;
+  if (description !== undefined) course.description = description;
+  if (shortDescription !== undefined) course.shortDescription = shortDescription;
+  if (category !== undefined) course.category = category;
+  if (level !== undefined) course.level = level;
+  if (language !== undefined) course.language = language;
+  if (pricingType !== undefined) course.pricingType = pricingType;
+  if (price !== undefined) course.price = isFreeCourse ? 0 : price;
+  if (discountPrice !== undefined) course.discountPrice = discountPrice || undefined;
+  if (isFreeCourse !== undefined) course.isFreeCourse = isFreeCourse;
+  if (subscriptionPlans !== undefined) course.subscriptionPlans = subscriptionPlans;
+  if (requirements !== undefined) course.requirements = requirements;
+  if (whatYouWillLearn !== undefined) course.whatYouWillLearn = whatYouWillLearn;
+  if (targetAudience !== undefined) course.targetAudience = targetAudience;
+  if (tags !== undefined) course.tags = tags;
+  if (certificateSettings !== undefined) course.certificateSettings = certificateSettings;
+
+  const updated = await course.save();
+
+  securityLog('COURSE_UPDATED', {
+    userId: req.user._id,
+    courseId: course._id,
+    ip: req.ip
+  });
+
+  res.json({
+    success: true,
+    message: 'Course updated successfully',
+    data: transformCourse(updated)
+  });
+});
+
+// =============================================
+// PRIVATE: UPDATE THUMBNAIL
+// =============================================
+export const updateCourseThumbnail = asyncHandler(async (req, res) => {
+  if (!req.file) {
+    res.status(400);
+    throw new Error('Please upload an image file');
+  }
+
+  if (!isValidId(req.params.id)) {
+    res.status(400);
+    throw new Error('Invalid course ID');
+  }
+
+  const course = await Course.findById(req.params.id);
+
+  if (!course) {
+    res.status(404);
+    throw new Error('Course not found');
+  }
+
+  if (!checkOwnership(course, req.user)) {
+    res.status(403);
+    throw new Error('Not authorized to update this course');
   }
 
   course.thumbnail = `thumbnails/${req.file.filename}`;
@@ -353,14 +543,20 @@ export const updateCourseThumbnail = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
+    message: 'Thumbnail updated successfully',
     data: { thumbnail: getFullImageUrl(course.thumbnail) }
   });
 });
 
-// @desc Delete course
-// @route DELETE /api/courses/:id
-// @access Private/Instructor
+// =============================================
+// PRIVATE: DELETE COURSE
+// =============================================
 export const deleteCourse = asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.id)) {
+    res.status(400);
+    throw new Error('Invalid course ID format');
+  }
+
   const course = await Course.findById(req.params.id);
 
   if (!course) {
@@ -368,20 +564,39 @@ export const deleteCourse = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  if (
-    req.user.role !== 'admin' &&
-    course.instructor.toString() !== req.user._id.toString()
-  ) {
+  if (!checkOwnership(course, req.user)) {
+    securityLog('UNAUTHORIZED_COURSE_DELETE', {
+      userId: req.user._id,
+      courseId: course._id,
+      ip: req.ip
+    });
     res.status(403);
     throw new Error('Not authorized to delete this course');
   }
 
-  const enrollments = await Enrollment.countDocuments({ course: course._id });
-  if (enrollments > 0 && req.user.role !== 'admin') {
+  // ✅ Check active enrollments
+  const activeEnrollments = await Enrollment.countDocuments({
+    course: course._id,
+    status: 'active'
+  });
+
+  if (activeEnrollments > 0 && req.user.role !== 'admin') {
     res.status(400);
-    throw new Error('Cannot delete course with active enrollments');
+    throw new Error(
+      `Cannot delete course with ${activeEnrollments} active enrollment(s). Contact admin.`
+    );
   }
 
+  // ✅ Log before deletion
+  securityLog('COURSE_DELETED', {
+    userId: req.user._id,
+    courseId: course._id,
+    courseTitle: course.title,
+    enrollments: activeEnrollments,
+    ip: req.ip
+  });
+
+  // ✅ Clean up lectures
   await Lecture.deleteMany({ course: course._id });
 
   await course.deleteOne();
@@ -392,10 +607,15 @@ export const deleteCourse = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc Publish/Unpublish course
-// @route PATCH /api/courses/:id/publish
-// @access Private/Instructor
+// =============================================
+// PRIVATE: TOGGLE PUBLISH
+// =============================================
 export const togglePublish = asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.id)) {
+    res.status(400);
+    throw new Error('Invalid course ID');
+  }
+
   const course = await Course.findById(req.params.id);
 
   if (!course) {
@@ -403,237 +623,60 @@ export const togglePublish = asyncHandler(async (req, res) => {
     throw new Error('Course not found');
   }
 
-  if (
-    req.user.role !== 'admin' &&
-    course.instructor.toString() !== req.user._id.toString()
-  ) {
+  if (!checkOwnership(course, req.user)) {
     res.status(403);
     throw new Error('Not authorized');
   }
 
+  // ✅ Check requirements before publishing
   if (!course.isPublished) {
-    const lectureCount = await Lecture.countDocuments({ course: course._id });
+    const lectureCount = await Lecture.countDocuments({
+      course: course._id,
+      isPublished: true
+    });
+
     if (lectureCount === 0) {
       res.status(400);
-      throw new Error('Course must have at least one lecture before publishing');
+      throw new Error('Course must have at least one published lecture before publishing');
     }
+
+    if (!course.title || !course.description || !course.category) {
+      res.status(400);
+      throw new Error('Course must have title, description, and category before publishing');
+    }
+
+    course.publishedAt = course.publishedAt || new Date();
   }
 
   course.isPublished = !course.isPublished;
-  if (course.isPublished && !course.publishedAt) {
-    course.publishedAt = new Date();
-  }
   await course.save();
+
+  securityLog('COURSE_PUBLISH_TOGGLED', {
+    userId: req.user._id,
+    courseId: course._id,
+    isPublished: course.isPublished,
+    ip: req.ip
+  });
 
   res.json({
     success: true,
-    data: { isPublished: course.isPublished }
+    data: {
+      isPublished: course.isPublished,
+      publishedAt: course.publishedAt
+    },
+    message: `Course ${course.isPublished ? 'published' : 'unpublished'} successfully`
   });
 });
 
-// @desc Add curriculum section
-// @route POST /api/courses/:id/sections
-// @access Private/Instructor
-export const addSection = asyncHandler(async (req, res) => {
-  const { sectionTitle, sectionDescription } = req.body;
-
-  const course = await Course.findById(req.params.id);
-
-  if (!course) {
-    res.status(404);
-    throw new Error('Course not found');
-  }
-
-  if (
-    req.user.role !== 'admin' &&
-    course.instructor.toString() !== req.user._id.toString()
-  ) {
-    res.status(403);
-    throw new Error('Not authorized');
-  }
-
-  const newSection = {
-    sectionTitle,
-    sectionDescription,
-    lectures: [],
-    order: course.curriculum.length
-  };
-
-  course.curriculum.push(newSection);
-  await course.save();
-
-  res.status(201).json({
-    success: true,
-    data: course.curriculum
-  });
-});
-
-// @desc Update curriculum section
-// @route PUT /api/courses/:id/sections/:sectionIndex
-// @access Private/Instructor
-export const updateSection = asyncHandler(async (req, res) => {
-  const { sectionTitle, sectionDescription } = req.body;
-  const { id, sectionIndex } = req.params;
-
-  const course = await Course.findById(id);
-
-  if (!course) {
-    res.status(404);
-    throw new Error('Course not found');
-  }
-
-  if (!course.curriculum[sectionIndex]) {
-    res.status(404);
-    throw new Error('Section not found');
-  }
-
-  if (
-    req.user.role !== 'admin' &&
-    course.instructor.toString() !== req.user._id.toString()
-  ) {
-    res.status(403);
-    throw new Error('Not authorized');
-  }
-
-  course.curriculum[sectionIndex].sectionTitle = sectionTitle;
-  course.curriculum[sectionIndex].sectionDescription = sectionDescription;
-  await course.save();
-
-  res.json({
-    success: true,
-    data: course.curriculum
-  });
-});
-
-// @desc Delete curriculum section
-// @route DELETE /api/courses/:id/sections/:sectionIndex
-// @access Private/Instructor
-export const deleteSection = asyncHandler(async (req, res) => {
-  const { id, sectionIndex } = req.params;
-
-  const course = await Course.findById(id);
-
-  if (!course) {
-    res.status(404);
-    throw new Error('Course not found');
-  }
-
-  if (!course.curriculum[sectionIndex]) {
-    res.status(404);
-    throw new Error('Section not found');
-  }
-
-  if (
-    req.user.role !== 'admin' &&
-    course.instructor.toString() !== req.user._id.toString()
-  ) {
-    res.status(403);
-    throw new Error('Not authorized');
-  }
-
-  const lectureIds = course.curriculum[sectionIndex].lectures;
-  await Lecture.deleteMany({ _id: { $in: lectureIds } });
-
-  course.curriculum.splice(sectionIndex, 1);
-  await course.save();
-
-  const totalLectures = await Lecture.countDocuments({ course: course._id });
-  course.totalLectures = totalLectures;
-  await course.save();
-
-  res.json({
-    success: true,
-    message: 'Section deleted successfully'
-  });
-});
-
-// @desc Get instructor's courses
-// @route GET /api/courses/instructor/my-courses
-// @access Private/Instructor
-export const getInstructorCourses = asyncHandler(async (req, res) => {
-  const { page, limit, skip } = paginate(req.query.page, req.query.limit);
-  const { status, search } = req.query;
-
-  const query = { instructor: req.user._id };
-
-  if (status === 'published') {
-    query.isPublished = true;
-  } else if (status === 'draft') {
-    query.isPublished = false;
-  }
-
-  if (search) {
-    query.title = { $regex: search, $options: 'i' };
-  }
-
-  const total = await Course.countDocuments(query);
-  const courses = await Course.find(query)
-    .populate('category', 'name')
-    .sort({ createdAt: -1 })
-    .skip(skip)
-    .limit(limit);
-
-  res.json({
-    success: true,
-    data: courses.map(transformCourse),
-    pagination: buildPaginationResponse(total, page, limit)
-  });
-});
-
-// @desc Get all courses (Admin)
-// @route GET /api/courses/admin/all
-// @access Private/Admin
-export const getAllCoursesAdmin = asyncHandler(async (req, res) => {
-  const { page, limit, skip } = paginate(req.query.page, req.query.limit);
-  const { status, search, category, instructor } = req.query;
-
-  const query = {};
-
-  if (status === 'published') {
-    query.isPublished = true;
-  } else if (status === 'draft') {
-    query.isPublished = false;
-  }
-
-  if (search) {
-    query.$or = [
-      { title: { $regex: search, $options: 'i' } },
-      { description: { $regex: search, $options: 'i' } }
-    ];
-  }
-
-  if (category && category !== 'all') {
-    const categoryId = await getCategoryId(category);
-    if (categoryId) {
-      query.category = categoryId;
-    }
-  }
-
-  if (instructor) {
-    if (mongoose.Types.ObjectId.isValid(instructor)) {
-      query.instructor = instructor;
-    }
-  }
-
-  const total = await Course.countDocuments(query);
-  const courses = await Course.find(query)
-    .populate('instructor', 'firstName lastName email avatar')
-    .populate('category', 'name')
-    .sort({ createdAt: -1 })
-    .skip(skip)
-    .limit(limit);
-
-  res.json({
-    success: true,
-    data: courses.map(transformCourse),
-    pagination: buildPaginationResponse(total, page, limit)
-  });
-});
-
-// @desc Toggle featured status
-// @route PATCH /api/courses/:id/featured
-// @access Private/Admin
+// =============================================
+// PRIVATE: TOGGLE FEATURED (Admin only)
+// =============================================
 export const toggleFeatured = asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.id)) {
+    res.status(400);
+    throw new Error('Invalid course ID');
+  }
+
   const course = await Course.findById(req.params.id);
 
   if (!course) {
@@ -646,6 +689,250 @@ export const toggleFeatured = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: { isFeatured: course.isFeatured }
+    data: { isFeatured: course.isFeatured },
+    message: `Course ${course.isFeatured ? 'featured' : 'unfeatured'} successfully`
+  });
+});
+
+// =============================================
+// PRIVATE: ADD SECTION
+// =============================================
+export const addSection = asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.id)) {
+    res.status(400);
+    throw new Error('Invalid course ID');
+  }
+
+  // ✅ Validation done by middleware
+  const { sectionTitle, sectionDescription } = req.body;
+
+  const course = await Course.findById(req.params.id);
+
+  if (!course) {
+    res.status(404);
+    throw new Error('Course not found');
+  }
+
+  if (!checkOwnership(course, req.user)) {
+    res.status(403);
+    throw new Error('Not authorized');
+  }
+
+  // ✅ Max sections limit
+  if (course.curriculum.length >= 50) {
+    res.status(400);
+    throw new Error('Maximum 50 sections allowed per course');
+  }
+
+  course.curriculum.push({
+    sectionTitle,
+    sectionDescription: sectionDescription || '',
+    lectures: [],
+    order: course.curriculum.length
+  });
+
+  await course.save();
+
+  res.status(201).json({
+    success: true,
+    message: 'Section added successfully',
+    data: course.curriculum
+  });
+});
+
+// =============================================
+// PRIVATE: UPDATE SECTION
+// =============================================
+export const updateSection = asyncHandler(async (req, res) => {
+  const { id, sectionIndex } = req.params;
+  const idx = parseInt(sectionIndex);
+
+  if (!isValidId(id)) {
+    res.status(400);
+    throw new Error('Invalid course ID');
+  }
+
+  if (isNaN(idx) || idx < 0) {
+    res.status(400);
+    throw new Error('Invalid section index');
+  }
+
+  const { sectionTitle, sectionDescription } = req.body;
+
+  const course = await Course.findById(id);
+
+  if (!course) {
+    res.status(404);
+    throw new Error('Course not found');
+  }
+
+  if (!course.curriculum[idx]) {
+    res.status(404);
+    throw new Error('Section not found');
+  }
+
+  if (!checkOwnership(course, req.user)) {
+    res.status(403);
+    throw new Error('Not authorized');
+  }
+
+  if (sectionTitle) course.curriculum[idx].sectionTitle = sectionTitle;
+  if (sectionDescription !== undefined) {
+    course.curriculum[idx].sectionDescription = sectionDescription;
+  }
+
+  course.markModified('curriculum');
+  await course.save();
+
+  res.json({
+    success: true,
+    message: 'Section updated successfully',
+    data: course.curriculum
+  });
+});
+
+// =============================================
+// PRIVATE: DELETE SECTION
+// =============================================
+export const deleteSection = asyncHandler(async (req, res) => {
+  const { id, sectionIndex } = req.params;
+  const idx = parseInt(sectionIndex);
+
+  if (!isValidId(id)) {
+    res.status(400);
+    throw new Error('Invalid course ID');
+  }
+
+  if (isNaN(idx) || idx < 0) {
+    res.status(400);
+    throw new Error('Invalid section index');
+  }
+
+  const course = await Course.findById(id);
+
+  if (!course) {
+    res.status(404);
+    throw new Error('Course not found');
+  }
+
+  if (!course.curriculum[idx]) {
+    res.status(404);
+    throw new Error('Section not found');
+  }
+
+  if (!checkOwnership(course, req.user)) {
+    res.status(403);
+    throw new Error('Not authorized');
+  }
+
+  // ✅ Delete lectures in this section
+  const lectureIds = course.curriculum[idx].lectures;
+  if (lectureIds?.length > 0) {
+    await Lecture.deleteMany({ _id: { $in: lectureIds } });
+  }
+
+  course.curriculum.splice(idx, 1);
+
+  // ✅ Recalculate total lectures
+  const totalLectures = await Lecture.countDocuments({ course: course._id });
+  course.totalLectures = totalLectures;
+
+  await course.save();
+
+  res.json({
+    success: true,
+    message: 'Section and its lectures deleted successfully'
+  });
+});
+
+// =============================================
+// PRIVATE: GET INSTRUCTOR COURSES
+// =============================================
+export const getInstructorCourses = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = paginate(req.query.page, req.query.limit);
+  const { status, search } = req.query;
+
+  const query = { instructor: req.user._id };
+
+  if (status === 'published') query.isPublished = true;
+  else if (status === 'draft') query.isPublished = false;
+
+  if (search && search.trim()) {
+    const escaped = escapeRegex(search.trim());
+    query.title = { $regex: new RegExp(escaped, 'i') };
+  }
+
+  const [total, courses] = await Promise.all([
+    Course.countDocuments(query),
+    Course.find(query)
+      .populate('category', 'name')
+      .select('-curriculum -certificateSettings')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean()
+  ]);
+
+  res.json({
+    success: true,
+    data: courses.map((c) => ({
+      ...c,
+      thumbnail: getFullImageUrl(c.thumbnail)
+    })),
+    pagination: buildPaginationResponse(total, page, limit)
+  });
+});
+
+// =============================================
+// ADMIN: GET ALL COURSES
+// =============================================
+export const getAllCoursesAdmin = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = paginate(req.query.page, req.query.limit);
+  const { status, search, category, instructor } = req.query;
+
+  const query = {};
+
+  if (status === 'published') query.isPublished = true;
+  else if (status === 'draft') query.isPublished = false;
+
+  if (search && search.trim()) {
+    const escaped = escapeRegex(search.trim());
+    query.$or = [
+      { title: { $regex: new RegExp(escaped, 'i') } },
+      { tags: { $regex: new RegExp(escaped, 'i') } }
+    ];
+  }
+
+  if (category && category !== 'all') {
+    const categoryId = await getCategoryId(category);
+    if (categoryId) query.category = categoryId;
+  }
+
+  if (instructor && isValidId(instructor)) {
+    query.instructor = new mongoose.Types.ObjectId(instructor);
+  }
+
+  const [total, courses] = await Promise.all([
+    Course.countDocuments(query),
+    Course.find(query)
+      .populate('instructor', 'firstName lastName email avatar')
+      .populate('category', 'name')
+      .select('-curriculum -certificateSettings')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean()
+  ]);
+
+  res.json({
+    success: true,
+    data: courses.map((c) => ({
+      ...c,
+      thumbnail: getFullImageUrl(c.thumbnail),
+      instructor: c.instructor
+        ? { ...c.instructor, avatar: getFullImageUrl(c.instructor.avatar) }
+        : null
+    })),
+    pagination: buildPaginationResponse(total, page, limit)
   });
 });

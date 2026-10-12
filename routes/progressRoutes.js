@@ -1,3 +1,4 @@
+// routes/progressRoutes.js
 import express from 'express';
 import {
   getCourseProgress,
@@ -11,41 +12,104 @@ import {
   addNote,
   getNotes,
   deleteNote,
-  getStudentProgress
+  getStudentProgress,
 } from '../controllers/progressController.js';
 
-import { protect } from '../middleware/authMiddleware.js';
+import { protect }   from '../middleware/authMiddleware.js';
 import { authorize } from '../middleware/roleMiddleware.js';
-import { uploadResources, handleMulterError } from '../middleware/uploadMiddleware.js';
+import {
+  uploadResources,
+  wrapMulter,
+} from '../middleware/uploadMiddleware.js';
+import { apiLimiter } from '../middleware/rateLimiter.js';
+import { auditLog }   from '../middleware/auditLog.js';
 
 const router = express.Router();
 
+// ✅ All routes require auth
 router.use(protect);
 
-/**
- * IMPORTANT:
- * Put the more specific route BEFORE the less specific one
- * so /course/:courseId/students is not confused with /course/:courseId
- */
+// ============================================
+// INSTRUCTOR ROUTES (specific first)
+// ============================================
+router.get(
+  '/course/:courseId/students',
+  authorize('instructor', 'admin'),
+  getStudentProgress
+);
 
-// Instructor routes
-router.get('/course/:courseId/students', authorize('instructor', 'admin'), getStudentProgress);
-router.put('/:progressId/grade', authorize('instructor', 'admin'), gradeAssignment);
+router.put(
+  '/:progressId/grade',
+  authorize('instructor', 'admin'),
+  auditLog('ASSIGNMENT_GRADED'),
+  gradeAssignment
+);
 
-// Student routes
+// ============================================
+// STUDENT - COURSE PROGRESS
+// ============================================
 router.get('/course/:courseId', getCourseProgress);
-router.get('/lecture/:lectureId', getLectureProgress);
-router.put('/lecture/:lectureId', updateLectureProgress);
 
-router.post('/lecture/:lectureId/complete', markLectureComplete);
-router.post('/lecture/:lectureId/incomplete', markLectureIncomplete);
+// ============================================
+// STUDENT - LECTURE PROGRESS
+// ============================================
+router.get('/lecture/:lectureId',  getLectureProgress);
+router.put('/lecture/:lectureId',  updateLectureProgress);
 
-router.post('/lecture/:lectureId/quiz', submitQuiz);
-router.post('/lecture/:lectureId/assignment', uploadResources, handleMulterError, submitAssignment);
+// ============================================
+// STUDENT - COMPLETE / INCOMPLETE
+// ============================================
+router.post(
+  '/lecture/:lectureId/complete',
+  apiLimiter,
+  auditLog('LECTURE_COMPLETE'),
+  markLectureComplete
+);
 
-// Notes
-router.get('/lecture/:lectureId/notes', getNotes);
-router.post('/lecture/:lectureId/notes', addNote);
-router.delete('/lecture/:lectureId/notes/:noteIndex', deleteNote);
+router.post(
+  '/lecture/:lectureId/incomplete',
+  apiLimiter,
+  markLectureIncomplete
+);
+
+// ============================================
+// STUDENT - QUIZ
+// ============================================
+router.post(
+  '/lecture/:lectureId/quiz',
+  apiLimiter,
+  auditLog('QUIZ_SUBMIT'),
+  submitQuiz
+);
+
+// ============================================
+// STUDENT - ASSIGNMENT
+// ============================================
+router.post(
+  '/lecture/:lectureId/assignment',
+  apiLimiter,
+  auditLog('ASSIGNMENT_SUBMIT'),
+  wrapMulter(uploadResources),
+  submitAssignment
+);
+
+// ============================================
+// STUDENT - NOTES
+// ============================================
+router.get(
+  '/lecture/:lectureId/notes',
+  getNotes
+);
+
+router.post(
+  '/lecture/:lectureId/notes',
+  apiLimiter,
+  addNote
+);
+
+router.delete(
+  '/lecture/:lectureId/notes/:noteIndex',
+  deleteNote
+);
 
 export default router;

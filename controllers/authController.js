@@ -2,98 +2,160 @@
 import asyncHandler from 'express-async-handler';
 import crypto from 'crypto';
 import User from '../models/User.js';
-import { generateToken } from '../utils/generateToken.js';
-import { 
-  sendWelcomeEmail, 
-  sendPasswordResetEmail
+import {
+  generateAccessToken,
+  generateRefreshToken,
+  setTokenCookies,
+  clearTokenCookies
+} from '../utils/generateToken.js';
+import {
+  sendWelcomeEmail,
+  sendPasswordResetEmail,
+  sendEmailVerificationEmail
 } from '../utils/emailService.js';
 import { getFullImageUrl } from '../utils/imageHelper.js';
+import { securityLog } from '../middleware/auditLog.js';
 
 // =============================================
-// HELPER FUNCTIONS
+// HELPERS
 // =============================================
 
-const generateRandomToken = () => {
-  return crypto.randomBytes(32).toString('hex');
-};
+const hashToken = (token) =>
+  crypto.createHash('sha256').update(token).digest('hex');
 
-const hashToken = (token) => {
-  return crypto.createHash('sha256').update(token).digest('hex');
-};
+const generateRandomToken = () =>
+  crypto.randomBytes(32).toString('hex');
 
-// ✅ FIXED: Transform user with full image URLs
-const createUserResponse = (user, token, isNewUser = false) => {
+// ✅ Minimal user response — only what UI needs
+const createUserResponse = (user) => {
   const userData = user.toObject ? user.toObject() : user;
-  
   return {
-    _id: userData._id,
+    id: userData._id,
     firstName: userData.firstName,
     lastName: userData.lastName,
-    fullName: userData.fullName || `${userData.firstName} ${userData.lastName}`,
     email: userData.email,
     role: userData.role,
     avatar: getFullImageUrl(userData.avatar),
-    authProvider: userData.authProvider,
-    token,
-    isNewUser
+    isEmailVerified: userData.isEmailVerified,
   };
+};
+
+// ✅ Don't send accessToken in response body anymore — it's in HttpOnly cookie
+const sendAuthResponse = async (res, user, statusCode = 200, isNewUser = false) => {
+  const accessToken = generateAccessToken(user._id);
+  const refreshToken = generateRefreshToken(user._id);
+
+  user.refreshToken = refreshToken;
+  user.lastLogin = new Date();
+  user.lastLoginIp = res.req?.ip;
+  await user.save({ validateBeforeSave: false });
+
+  setTokenCookies(res, accessToken, refreshToken);
+
+  res.status(statusCode).json({
+    success: true,
+    data: {
+      user: createUserResponse(user),
+      isNewUser,
+    },
+  });
+};
+
+// ✅ Fire and forget email helper
+const sendEmailAsync = (emailFn, ...args) => {
+  setImmediate(async () => {
+    try {
+      await emailFn(...args);
+    } catch (err) {
+      console.error(`📧 Background email failed: ${err.message}`);
+    }
+  });
 };
 
 // =============================================
 // REGISTER
 // =============================================
 export const register = asyncHandler(async (req, res) => {
-  const { firstName, lastName, email, password, phone } = req.body;
+  const { firstName, lastName, email, password, phone, termsAccepted } = req.body;
 
-  if (!firstName || !lastName || !email || !password) {
+  if (!termsAccepted) {
     res.status(400);
-    throw new Error('Please provide all required fields');
-  }
-
-  if (password.length < 6) {
-    res.status(400);
-    throw new Error('Password must be at least 6 characters');
+    throw new Error('You must accept the Terms of Service and Privacy Policy');
   }
 
   const userExists = await User.findOne({ email: email.toLowerCase() });
-  
+
   if (userExists) {
-    if (userExists.googleId && userExists.authProvider === 'google') {
+    if (userExists.authProvider === 'google' && !userExists.password) {
       res.status(400);
-      throw new Error('This email is registered with Google. Please use Google login.');
+      throw new Error('This email is registered with Google. Please use Google Sign In.');
     }
+
+    if (!userExists.isEmailVerified) {
+      const verificationToken = generateRandomToken();
+      userExists.emailVerificationToken = hashToken(verificationToken);
+      userExists.emailVerificationExpire = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      await userExists.save({ validateBeforeSave: false });
+
+      res.status(200).json({
+        success: true,
+        message: 'Account already exists but email is not verified. We have resent the verification link.',
+        data: {
+          email: userExists.email,
+          requiresVerification: true,
+          alreadyExists: true
+        }
+      });
+
+      sendEmailAsync(sendEmailVerificationEmail, userExists, verificationToken);
+      return;
+    }
+
     res.status(400);
-    throw new Error('User already exists with this email');
+    throw new Error('An account with this email already exists. Please sign in.');
   }
+
+  const verificationToken = generateRandomToken();
+  const hashedVerificationToken = hashToken(verificationToken);
 
   const user = await User.create({
     firstName,
     lastName,
     email: email.toLowerCase(),
     password,
-    phone,
+    phone: phone || undefined,
     authProvider: 'local',
-    isActive: true
+    isActive: true,
+    isEmailVerified: false,
+    emailVerificationToken: hashedVerificationToken,
+    emailVerificationExpire: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    termsAcceptedAt: new Date(),
+    termsVersion: '1.0'
   });
 
-  if (user) {
-    try {
-      await sendWelcomeEmail(user);
-    } catch (error) {
-      console.error('Failed to send welcome email:', error);
-    }
-
-    const token = generateToken(user._id);
-
-    res.status(201).json({
-      success: true,
-      message: 'Registration successful!',
-      data: createUserResponse(user, token, true)
-    });
-  } else {
+  if (!user) {
     res.status(400);
-    throw new Error('Invalid user data');
+    throw new Error('Failed to create account. Please try again.');
   }
+
+  securityLog('USER_REGISTERED', {
+    userId: user._id,
+    email: user.email,
+    ip: req.ip,
+    authProvider: 'local'
+  });
+
+  res.status(201).json({
+    success: true,
+    message: 'Account created successfully! Please check your email to verify your account.',
+    data: {
+      email: user.email,
+      requiresVerification: true
+    }
+  });
+
+  sendEmailAsync(sendEmailVerificationEmail, user, verificationToken);
+  sendEmailAsync(sendWelcomeEmail, user);
 });
 
 // =============================================
@@ -102,27 +164,48 @@ export const register = asyncHandler(async (req, res) => {
 export const login = asyncHandler(async (req, res) => {
   const { email, password } = req.body;
 
-  if (!email || !password) {
-    res.status(400);
-    throw new Error('Please provide email and password');
+  const user = await User.findOne({ email: email.toLowerCase() })
+    .select('+password +loginAttempts +lockUntil +passwordChangedAt +refreshToken');
+
+  if (user?.lockUntil && user.lockUntil > Date.now()) {
+    const minutesLeft = Math.ceil((user.lockUntil - Date.now()) / 60000);
+    securityLog('LOGIN_ACCOUNT_LOCKED', { email: email.toLowerCase(), ip: req.ip });
+    res.status(423);
+    throw new Error(`Account locked. Try again in ${minutesLeft} minutes.`);
   }
 
-  const user = await User.findOne({ email: email.toLowerCase() }).select('+password');
-
   if (!user) {
+    securityLog('LOGIN_INVALID_EMAIL', { email: email.toLowerCase(), ip: req.ip });
     res.status(401);
     throw new Error('Invalid email or password');
   }
 
-  if (user.googleId && user.authProvider === 'google' && !user.password) {
+  if (user.authProvider === 'google' && !user.password) {
     res.status(400);
-    throw new Error('This account uses Google login. Please sign in with Google.');
+    throw new Error('This account uses Google Sign In. Please use the Google button.');
   }
 
   const isMatch = await user.comparePassword(password);
+
   if (!isMatch) {
+    await user.incrementLoginAttempts();
+    const attemptsLeft = Math.max(0, 5 - (user.loginAttempts + 1));
+
+    securityLog('LOGIN_FAILED_PASSWORD', {
+      userId: user._id,
+      ip: req.ip,
+      attemptsLeft
+    });
+
+    if (attemptsLeft === 0) {
+      res.status(423);
+      throw new Error('Too many failed attempts. Account locked for 30 minutes.');
+    }
+
     res.status(401);
-    throw new Error('Invalid email or password');
+    throw new Error(
+      `Invalid email or password. ${attemptsLeft} attempt${attemptsLeft !== 1 ? 's' : ''} remaining.`
+    );
   }
 
   if (!user.isActive) {
@@ -130,82 +213,69 @@ export const login = asyncHandler(async (req, res) => {
     throw new Error('Your account has been deactivated. Please contact support.');
   }
 
-  user.lastLogin = new Date();
-  await user.save({ validateBeforeSave: false });
+  await user.resetLoginAttempts();
 
-  const token = generateToken(user._id);
+  securityLog('LOGIN_SUCCESS', { userId: user._id, ip: req.ip });
 
-  res.json({
-    success: true,
-    data: createUserResponse(user, token)
-  });
+  await sendAuthResponse(res, user, 200, false);
 });
 
 // =============================================
 // GOOGLE AUTH
 // =============================================
 export const googleAuth = asyncHandler(async (req, res) => {
-  const { googleUser, credential } = req.body;
+  const { googleUser } = req.body;
 
-  let email, firstName, lastName, googleId, picture;
-
-  if (googleUser) {
-    email = googleUser.email;
-    googleId = googleUser.sub;
-    picture = googleUser.picture;
-    
-    const nameParts = (googleUser.name || '').split(' ');
-    firstName = googleUser.given_name || nameParts[0] || 'User';
-    lastName = googleUser.family_name || nameParts.slice(1).join(' ') || '';
-  } else if (credential) {
-    try {
-      const base64Url = credential.split('.')[1];
-      const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-      const jsonPayload = decodeURIComponent(
-        atob(base64)
-          .split('')
-          .map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
-          .join('')
-      );
-      const payload = JSON.parse(jsonPayload);
-      
-      email = payload.email;
-      googleId = payload.sub;
-      picture = payload.picture;
-      firstName = payload.given_name || payload.name?.split(' ')[0] || 'User';
-      lastName = payload.family_name || payload.name?.split(' ').slice(1).join(' ') || '';
-    } catch (error) {
-      console.error('Token decode error:', error);
-      res.status(400);
-      throw new Error('Invalid Google token');
-    }
-  } else {
+  if (!googleUser) {
     res.status(400);
-    throw new Error('Google credentials required');
+    throw new Error('Google user data is required');
   }
+
+  const {
+    email,
+    sub: googleId,
+    picture,
+    given_name,
+    family_name,
+    name,
+    email_verified
+  } = googleUser;
 
   if (!email || !googleId) {
     res.status(400);
-    throw new Error('Could not retrieve Google account information');
+    throw new Error('Invalid Google account data');
   }
 
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    res.status(400);
+    throw new Error('Invalid email from Google account');
+  }
+
+  if (email_verified === false) {
+    res.status(400);
+    throw new Error('Google account email is not verified');
+  }
+
+  const firstName = (given_name || name?.split(' ')[0] || 'User')
+    .trim().substring(0, 50).replace(/[^a-zA-Z\s'-]/g, '');
+
+  const lastName = (family_name || name?.split(' ').slice(1).join(' ') || '')
+    .trim().substring(0, 50).replace(/[^a-zA-Z\s'-]/g, '');
+
+  const avatarUrl = picture?.startsWith('http') ? picture : null;
+
   let user = await User.findOne({
-    $or: [
-      { googleId },
-      { email: email.toLowerCase() }
-    ]
-  });
+    $or: [{ googleId }, { email: email.toLowerCase() }]
+  }).select('+refreshToken +loginAttempts +lockUntil');
 
   let isNewUser = false;
 
   if (user) {
-    if (!user.googleId) {
-      user.googleId = googleId;
-      user.authProvider = user.password ? 'local' : 'google';
-      if (picture && !user.avatar.includes('uploads')) {
-        user.avatar = picture;
-      }
-      await user.save();
+    if (user.lockUntil && user.lockUntil > Date.now()) {
+      const minutesLeft = Math.ceil((user.lockUntil - Date.now()) / 60000);
+      res.status(423);
+      throw new Error(`Account locked. Try again in ${minutesLeft} minutes.`);
     }
 
     if (!user.isActive) {
@@ -213,35 +283,128 @@ export const googleAuth = asyncHandler(async (req, res) => {
       throw new Error('Your account has been deactivated. Please contact support.');
     }
 
-    user.lastLogin = new Date();
+    if (!user.googleId) user.googleId = googleId;
+    if (avatarUrl && user.avatar === 'avatars/default-avatar.png') {
+      user.avatar = avatarUrl;
+    }
+    if (!user.isEmailVerified) user.isEmailVerified = true;
+
     await user.save({ validateBeforeSave: false });
+
+    securityLog('GOOGLE_LOGIN_SUCCESS', { userId: user._id, ip: req.ip });
 
   } else {
     isNewUser = true;
 
     user = await User.create({
-      firstName,
-      lastName,
+      firstName: firstName || 'User',
+      lastName: lastName || '',
       email: email.toLowerCase(),
       googleId,
       authProvider: 'google',
-      avatar: picture || 'avatars/default-avatar.png',
-      isActive: true
+      avatar: avatarUrl || 'avatars/default-avatar.png',
+      isActive: true,
+      isEmailVerified: true,
+      termsAcceptedAt: new Date(),
+      termsVersion: '1.0'
     });
 
-    try {
-      await sendWelcomeEmail(user);
-    } catch (error) {
-      console.error('Failed to send welcome email:', error);
-    }
+    securityLog('GOOGLE_REGISTER_SUCCESS', { userId: user._id, ip: req.ip });
+
+    sendEmailAsync(sendWelcomeEmail, user);
   }
 
-  const token = generateToken(user._id);
+  await sendAuthResponse(res, user, isNewUser ? 201 : 200, isNewUser);
+});
+
+// =============================================
+// REFRESH TOKEN
+// =============================================
+export const refreshToken = asyncHandler(async (req, res) => {
+  const user = req.user;
+
+  const newAccessToken = generateAccessToken(user._id);
+  const newRefreshToken = generateRefreshToken(user._id);
+
+  user.refreshToken = newRefreshToken;
+  await user.save({ validateBeforeSave: false });
+
+  setTokenCookies(res, newAccessToken, newRefreshToken);
 
   res.json({
     success: true,
-    data: createUserResponse(user, token, isNewUser)
+    data: { accessToken: newAccessToken }
   });
+});
+
+// =============================================
+// VERIFY EMAIL
+// =============================================
+export const verifyEmail = asyncHandler(async (req, res) => {
+  const { token } = req.params;
+
+  if (!token) {
+    res.status(400);
+    throw new Error('Verification token is required');
+  }
+
+  const hashedToken = hashToken(token);
+
+  const user = await User.findOne({
+    emailVerificationToken: hashedToken,
+    emailVerificationExpire: { $gt: Date.now() }
+  }).select('+emailVerificationToken +emailVerificationExpire +refreshToken');
+
+  if (!user) {
+    res.status(400);
+    throw new Error('Invalid or expired verification link. Please request a new one.');
+  }
+
+  user.isEmailVerified = true;
+  user.emailVerificationToken = undefined;
+  user.emailVerificationExpire = undefined;
+  await user.save({ validateBeforeSave: false });
+
+  securityLog('EMAIL_VERIFIED', { userId: user._id, ip: req.ip });
+
+  await sendAuthResponse(res, user, 200, false);
+});
+
+// =============================================
+// RESEND VERIFICATION
+// =============================================
+export const resendVerification = asyncHandler(async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    res.status(400);
+    throw new Error('Email is required');
+  }
+
+  const genericMessage = 'If an account exists, a verification link has been sent.';
+
+  const user = await User.findOne({ email: email.toLowerCase() })
+    .select('+emailVerificationToken +emailVerificationExpire');
+
+  if (!user) {
+    return res.json({ success: true, message: genericMessage });
+  }
+
+  if (user.isEmailVerified) {
+    return res.json({
+      success: true,
+      message: 'Email is already verified. Please sign in.'
+    });
+  }
+
+  const verificationToken = generateRandomToken();
+  user.emailVerificationToken = hashToken(verificationToken);
+  user.emailVerificationExpire = new Date(Date.now() + 24 * 60 * 60 * 1000);
+  await user.save({ validateBeforeSave: false });
+
+  res.json({ success: true, message: genericMessage });
+
+  sendEmailAsync(sendEmailVerificationEmail, user, verificationToken);
 });
 
 // =============================================
@@ -250,24 +413,17 @@ export const googleAuth = asyncHandler(async (req, res) => {
 export const forgotPassword = asyncHandler(async (req, res) => {
   const { email } = req.body;
 
-  if (!email) {
-    res.status(400);
-    throw new Error('Please provide your email address');
-  }
+  const genericMessage = 'If an account exists with this email, you will receive a password reset link.';
 
-  const user = await User.findOne({ email: email.toLowerCase() });
+  const user = await User.findOne({ email: email.toLowerCase() })
+    .select('+resetPasswordToken +resetPasswordExpire');
 
   if (!user) {
-    res.json({
-      success: true,
-      message: 'If an account exists with this email, you will receive a password reset link.'
-    });
-    return;
+    return res.json({ success: true, message: genericMessage });
   }
 
   if (user.authProvider === 'google' && !user.password) {
-    res.status(400);
-    throw new Error('This account uses Google login. Please sign in with Google.');
+    return res.json({ success: true, message: genericMessage });
   }
 
   const resetToken = generateRandomToken();
@@ -275,21 +431,41 @@ export const forgotPassword = asyncHandler(async (req, res) => {
   user.resetPasswordExpire = new Date(Date.now() + 60 * 60 * 1000);
   await user.save({ validateBeforeSave: false });
 
-  try {
-    await sendPasswordResetEmail(user, resetToken);
-    res.json({
-      success: true,
-      message: 'Password reset link sent to your email.'
-    });
-  } catch (error) {
-    user.resetPasswordToken = undefined;
-    user.resetPasswordExpire = undefined;
-    await user.save({ validateBeforeSave: false });
+  securityLog('PASSWORD_RESET_REQUESTED', { userId: user._id, ip: req.ip });
 
-    console.error('Failed to send password reset email:', error);
-    res.status(500);
-    throw new Error('Failed to send email. Please try again later.');
+  res.json({ success: true, message: genericMessage });
+
+  sendEmailAsync(sendPasswordResetEmail, user, resetToken);
+});
+
+// =============================================
+// VALIDATE RESET TOKEN
+// =============================================
+export const validateResetToken = asyncHandler(async (req, res) => {
+  const { token } = req.params;
+
+  if (!token) {
+    res.status(400);
+    throw new Error('Reset token is required');
   }
+
+  const hashedToken = hashToken(token);
+
+  const user = await User.findOne({
+    resetPasswordToken: hashedToken,
+    resetPasswordExpire: { $gt: Date.now() }
+  }).select('email');
+
+  if (!user) {
+    res.status(400);
+    throw new Error('Invalid or expired reset link. Please request a new one.');
+  }
+
+  res.json({
+    success: true,
+    valid: true,
+    email: user.email.replace(/(.{2}).+(@.+)/, '$1***$2')
+  });
 });
 
 // =============================================
@@ -299,71 +475,43 @@ export const resetPassword = asyncHandler(async (req, res) => {
   const { token } = req.params;
   const { password } = req.body;
 
-  if (!password || password.length < 6) {
-    res.status(400);
-    throw new Error('Password must be at least 6 characters');
-  }
-
   const hashedToken = hashToken(token);
 
   const user = await User.findOne({
     resetPasswordToken: hashedToken,
     resetPasswordExpire: { $gt: Date.now() }
-  });
+  }).select('+password +refreshToken +resetPasswordToken +resetPasswordExpire');
 
   if (!user) {
     res.status(400);
     throw new Error('Invalid or expired reset link. Please request a new one.');
   }
 
+  if (user.password) {
+    const isSame = await user.comparePassword(password);
+    if (isSame) {
+      res.status(400);
+      throw new Error('New password must be different from your current password');
+    }
+  }
+
   user.password = password;
   user.resetPasswordToken = undefined;
   user.resetPasswordExpire = undefined;
-  
-  if (user.authProvider === 'google') {
-    user.authProvider = 'local';
-  }
-  
+  user.refreshToken = undefined;
+
   await user.save();
 
-  const authToken = generateToken(user._id);
+  securityLog('PASSWORD_RESET_SUCCESS', { userId: user._id, ip: req.ip });
 
   res.json({
     success: true,
-    message: 'Password reset successful! You can now login.',
-    data: {
-      token: authToken
-    }
+    message: 'Password reset successful! Please sign in with your new password.'
   });
 });
 
 // =============================================
-// VALIDATE RESET TOKEN
-// =============================================
-export const validateResetToken = asyncHandler(async (req, res) => {
-  const { token } = req.params;
-
-  const hashedToken = hashToken(token);
-
-  const user = await User.findOne({
-    resetPasswordToken: hashedToken,
-    resetPasswordExpire: { $gt: Date.now() }
-  });
-
-  if (!user) {
-    res.status(400);
-    throw new Error('Invalid or expired reset link');
-  }
-
-  res.json({
-    success: true,
-    valid: true,
-    email: user.email
-  });
-});
-
-// =============================================
-// GET CURRENT USER
+// GET ME
 // =============================================
 export const getMe = asyncHandler(async (req, res) => {
   const user = await User.findById(req.user._id)
@@ -376,24 +524,27 @@ export const getMe = asyncHandler(async (req, res) => {
   }
 
   const userData = user.toObject();
-  
-  // ✅ Transform all image URLs
-  const transformedUser = {
-    ...userData,
-    avatar: getFullImageUrl(userData.avatar),
-    enrolledCourses: userData.enrolledCourses?.map(course => ({
-      ...course,
-      thumbnail: getFullImageUrl(course.thumbnail)
-    })),
-    wishlist: userData.wishlist?.map(course => ({
-      ...course,
-      thumbnail: getFullImageUrl(course.thumbnail)
-    }))
-  };
 
   res.json({
     success: true,
-    data: transformedUser
+    data: {
+      ...createUserResponse(user),
+      phone: userData.phone,
+      bio: userData.bio,
+      address: userData.address,
+      socialLinks: userData.socialLinks,
+      education: userData.education,
+      enrolledCourses: userData.enrolledCourses?.map(c => ({
+        ...c,
+        thumbnail: getFullImageUrl(c.thumbnail)
+      })),
+      wishlist: userData.wishlist?.map(c => ({
+        ...c,
+        thumbnail: getFullImageUrl(c.thumbnail)
+      })),
+      lastLogin: userData.lastLogin,
+      createdAt: userData.createdAt
+    }
   });
 });
 
@@ -402,13 +553,8 @@ export const getMe = asyncHandler(async (req, res) => {
 // =============================================
 export const updateProfile = asyncHandler(async (req, res) => {
   const {
-    firstName,
-    lastName,
-    phone,
-    bio,
-    address,
-    socialLinks,
-    education
+    firstName, lastName, phone,
+    bio, address, socialLinks, education
   } = req.body;
 
   const user = await User.findById(req.user._id);
@@ -418,24 +564,20 @@ export const updateProfile = asyncHandler(async (req, res) => {
     throw new Error('User not found');
   }
 
-  user.firstName = firstName || user.firstName;
-  user.lastName = lastName || user.lastName;
-  user.phone = phone || user.phone;
-  user.bio = bio || user.bio;
-  user.address = address || user.address;
-  user.socialLinks = socialLinks || user.socialLinks;
-  user.education = education || user.education;
+  if (firstName !== undefined) user.firstName = firstName;
+  if (lastName !== undefined) user.lastName = lastName;
+  if (phone !== undefined) user.phone = phone;
+  if (bio !== undefined) user.bio = bio;
+  if (address !== undefined) user.address = { ...user.address, ...address };
+  if (socialLinks !== undefined) user.socialLinks = { ...user.socialLinks, ...socialLinks };
+  if (education !== undefined) user.education = education;
 
-  const updatedUser = await user.save();
-
-  const userData = updatedUser.toObject();
+  const updated = await user.save();
 
   res.json({
     success: true,
-    data: {
-      ...userData,
-      avatar: getFullImageUrl(userData.avatar)
-    }
+    message: 'Profile updated successfully',
+    data: createUserResponse(updated)
   });
 });
 
@@ -445,20 +587,23 @@ export const updateProfile = asyncHandler(async (req, res) => {
 export const updateAvatar = asyncHandler(async (req, res) => {
   if (!req.file) {
     res.status(400);
-    throw new Error('Please upload an image');
+    throw new Error('Please upload an image file');
   }
 
   const user = await User.findById(req.user._id);
-  
-  // ✅ Save only relative path
+
+  if (!user) {
+    res.status(404);
+    throw new Error('User not found');
+  }
+
   user.avatar = `avatars/${req.file.filename}`;
-  await user.save();
+  await user.save({ validateBeforeSave: false });
 
   res.json({
     success: true,
-    data: {
-      avatar: getFullImageUrl(user.avatar) // ✅ Return full URL
-    }
+    message: 'Avatar updated successfully',
+    data: { avatar: getFullImageUrl(user.avatar) }
   });
 });
 
@@ -468,40 +613,49 @@ export const updateAvatar = asyncHandler(async (req, res) => {
 export const updatePassword = asyncHandler(async (req, res) => {
   const { currentPassword, newPassword } = req.body;
 
-  if (!newPassword || newPassword.length < 6) {
-    res.status(400);
-    throw new Error('New password must be at least 6 characters');
-  }
+  const user = await User.findById(req.user._id)
+    .select('+password +refreshToken');
 
-  const user = await User.findById(req.user._id).select('+password');
+  if (!user) {
+    res.status(404);
+    throw new Error('User not found');
+  }
 
   if (user.password) {
     if (!currentPassword) {
       res.status(400);
       throw new Error('Current password is required');
     }
-    
+
     const isMatch = await user.comparePassword(currentPassword);
     if (!isMatch) {
+      securityLog('PASSWORD_UPDATE_WRONG_CURRENT', {
+        userId: user._id, ip: req.ip
+      });
       res.status(401);
       throw new Error('Current password is incorrect');
+    }
+
+    const isSame = await user.comparePassword(newPassword);
+    if (isSame) {
+      res.status(400);
+      throw new Error('New password must be different from current password');
     }
   }
 
   user.password = newPassword;
-  
-  if (user.authProvider === 'google') {
-    user.authProvider = 'local';
-  }
-  
+  if (user.authProvider === 'google') user.authProvider = 'local';
+  user.refreshToken = undefined;
+
   await user.save();
 
-  const token = generateToken(user._id);
+  securityLog('PASSWORD_UPDATED', { userId: user._id, ip: req.ip });
+
+  clearTokenCookies(res);
 
   res.json({
     success: true,
-    message: 'Password updated successfully',
-    data: { token }
+    message: 'Password updated successfully. Please sign in again.'
   });
 });
 
@@ -509,33 +663,36 @@ export const updatePassword = asyncHandler(async (req, res) => {
 // LOGOUT
 // =============================================
 export const logout = asyncHandler(async (req, res) => {
-  res.json({
-    success: true,
-    message: 'Logged out successfully'
-  });
+  if (req.user) {
+    await User.findByIdAndUpdate(
+      req.user._id,
+      { $unset: { refreshToken: 1 } },
+      { validateBeforeSave: false }
+    );
+    securityLog('LOGOUT', { userId: req.user._id, ip: req.ip });
+  }
+
+  clearTokenCookies(res);
+
+  res.json({ success: true, message: 'Logged out successfully' });
 });
 
 // =============================================
-// CHECK AUTH STATUS
+// CHECK AUTH
 // =============================================
 export const checkAuth = asyncHandler(async (req, res) => {
   const user = await User.findById(req.user._id);
 
-  if (!user) {
+  if (!user || !user.isActive) {
     res.status(401);
     throw new Error('Not authenticated');
   }
-
-  const userData = user.toObject();
 
   res.json({
     success: true,
     data: {
       isAuthenticated: true,
-      user: {
-        ...userData,
-        avatar: getFullImageUrl(userData.avatar)
-      }
+      user: createUserResponse(user)
     }
   });
 });

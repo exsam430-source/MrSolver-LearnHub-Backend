@@ -1,18 +1,37 @@
-import dotenv from 'dotenv';
-dotenv.config();
+// server.js - FIXED for Express 5 + Hostinger
+// ✅ Services & Projects routes registered
+import './config/env.js';
 
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
-import rateLimit from 'express-rate-limit';
+import cookieParser from 'cookie-parser';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 import connectDB from './config/db.js';
 import { errorHandler, notFound } from './middleware/errorMiddleware.js';
+import { apiLimiter } from './middleware/rateLimiter.js';
 
-// Route imports
+console.log('🔍 ENV CHECK:', {
+  NODE_ENV: process.env.NODE_ENV,
+  PORT: process.env.PORT,
+  MONGO_URI: process.env.MONGO_URI ? '✅ set' : '❌ MISSING',
+  JWT_SECRET: process.env.JWT_SECRET ? '✅ set' : '❌ MISSING',
+  FRONTEND_URL: process.env.FRONTEND_URL,
+});
+
+const requiredEnvVars = ['MONGO_URI', 'JWT_SECRET', 'JWT_REFRESH_SECRET'];
+const missingVars = requiredEnvVars.filter((v) => !process.env[v]);
+if (missingVars.length > 0) {
+  console.error(`❌ Missing required env vars: ${missingVars.join(', ')}`);
+  process.exit(1);
+}
+
+// =============================================
+// ROUTE IMPORTS
+// =============================================
 import authRoutes from './routes/authRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import courseRoutes from './routes/courseRoutes.js';
@@ -26,56 +45,151 @@ import progressRoutes from './routes/progressRoutes.js';
 import dashboardRoutes from './routes/dashboardRoutes.js';
 import siteRoutes from './routes/siteRoutes.js';
 import certificateRoutes from './routes/certificateRoutes.js';
-import codeRoutes from './routes/courseRoutes.js';
+import codeRoutes from './routes/codeRoutes.js';
+
+// ✅ NEW: Services & Projects routes
+import serviceRoutes from './routes/serviceRoutes.js';
+import projectRoutes from './routes/projectRoutes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Connect to database
 connectDB();
 
 const app = express();
 
-// Trust proxy - IMPORTANT FOR RAILWAY/VERCEL
+const PORT = parseInt(process.env.PORT, 10) || 3000;
+const isProduction = process.env.NODE_ENV === 'production';
+
 app.set('trust proxy', 1);
 
-// CORS configuration - MUST BE FIRST
-app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:3000',
-    'http://127.0.0.1:5173',
-    'https://mr-solver-learn-hub.vercel.app'
-  ],
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
-}));
+// =============================================
+// CORS
+// =============================================
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:5173',
+  'https://mrsolverlearninghub.com',
+  'https://www.mrsolverlearninghub.com',
+  'https://mistyrose-cat-644040.hostingersite.com',
+  process.env.FRONTEND_URL,
+].filter(Boolean);
 
-// Security middleware
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" },
-  crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" }
-}));
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 500,
-  message: { message: 'Too many requests, please try again later.' },
-  standardHeaders: true,
-  legacyHeaders: false,
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+
+      if (origin.endsWith('.hostingersite.com')) return callback(null, true);
+
+      console.warn(`⚠️ CORS blocked: ${origin}`);
+      return callback(new Error(`CORS blocked: ${origin}`));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    exposedHeaders: ['X-Total-Count', 'X-Request-Id'],
+  })
+);
+
+// =============================================
+// SECURITY & MIDDLEWARE
+// =============================================
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    crossOriginOpenerPolicy: false,
+    hsts: isProduction ? { maxAge: 31536000, includeSubDomains: true } : false,
+  })
+);
+
+app.use(cookieParser(process.env.COOKIE_SECRET || process.env.JWT_SECRET));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// MongoDB Key Sanitizer
+app.use((req, res, next) => {
+  const sanitizeKeys = (obj) => {
+    if (!obj || typeof obj !== 'object') return obj;
+    if (Array.isArray(obj)) return obj.map((item) => sanitizeKeys(item));
+    const cleaned = {};
+    for (const key of Object.keys(obj)) {
+      const safeKey = key.startsWith('$') ? `_${key.slice(1)}` : key;
+      const value = obj[key];
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        cleaned[safeKey] = sanitizeKeys(value);
+      } else if (Array.isArray(value)) {
+        cleaned[safeKey] = value.map((item) => sanitizeKeys(item));
+      } else {
+        cleaned[safeKey] = value;
+      }
+    }
+    return cleaned;
+  };
+  if (req.body && typeof req.body === 'object') {
+    req.body = sanitizeKeys(req.body);
+  }
+  next();
 });
-app.use('/api', limiter);
 
-// Body parser
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// Logger
+if (!isProduction) {
+  app.use(morgan('dev'));
+} else {
+  app.use(morgan(':method :url :status :response-time ms'));
+}
 
-// Static files
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// Request ID
+app.use((req, res, next) => {
+  req.requestId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  res.setHeader('X-Request-Id', req.requestId);
+  next();
+});
 
-// API Routes
+// Rate Limiter
+app.use('/api', apiLimiter);
+
+// =============================================
+// STATIC UPLOADS
+// =============================================
+app.use('/uploads/avatars', express.static(path.join(__dirname, 'uploads', 'avatars')));
+app.use('/uploads/thumbnails', express.static(path.join(__dirname, 'uploads', 'thumbnails')));
+app.use('/uploads/certificates', express.static(path.join(__dirname, 'uploads', 'certificates')));
+app.use('/uploads/payments', express.static(path.join(__dirname, 'uploads', 'payments')));
+app.use('/uploads/lectures', express.static(path.join(__dirname, 'uploads', 'lectures')));
+app.use('/uploads/resources', express.static(path.join(__dirname, 'uploads', 'resources')));
+
+// ✅ NEW: Services & Projects static uploads
+app.use('/uploads/services', express.static(path.join(__dirname, 'uploads', 'services')));
+app.use('/uploads/projects', express.static(path.join(__dirname, 'uploads', 'projects')));
+
+// =============================================
+// HEALTH CHECK
+// =============================================
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV,
+    port: PORT,
+    message: 'Backend running successfully!',
+    features: {
+      auth: '✅',
+      courses: '✅',
+      services: '✅',
+      projects: '✅',
+      payments: '✅',
+    },
+  });
+});
+
+// =============================================
+// API ROUTES
+// =============================================
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/courses', courseRoutes);
@@ -91,26 +205,57 @@ app.use('/api/site', siteRoutes);
 app.use('/api/certificates', certificateRoutes);
 app.use('/api/code', codeRoutes);
 
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'OK',
-    message: 'LearnHub API is running',
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV
-  });
-});
+// ✅ NEW: Services & Projects routes
+app.use('/api/services', serviceRoutes);
+app.use('/api/projects', projectRoutes);
 
-// Error handling
+// =============================================
+// ✅ SERVE REACT FRONTEND (PRODUCTION)
+// Express 5 compatible - uses middleware
+// =============================================
+if (isProduction) {
+  const frontendDistPath = path.join(__dirname, 'dist');
+
+  app.use(express.static(frontendDistPath));
+
+  app.use((req, res, next) => {
+    if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
+      return next();
+    }
+    res.sendFile(path.join(frontendDistPath, 'index.html'), (err) => {
+      if (err) {
+        console.error('Error serving index.html:', err.message);
+        next(err);
+      }
+    });
+  });
+
+  console.log('📦 Serving frontend from:', frontendDistPath);
+}
+
+// =============================================
+// ERROR HANDLERS
+// =============================================
 app.use(notFound);
 app.use(errorHandler);
 
-const PORT = process.env.PORT || 5000;
-
-app.listen(PORT, () => {
+// =============================================
+// START SERVER
+// =============================================
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🌐 Backend URL: ${process.env.BACKEND_URL || 'http://localhost:' + PORT}`);
+  console.log(`📍 Environment: ${process.env.NODE_ENV}`);
+  console.log(`✨ New features: Services & Portfolio routes registered`);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error(`❌ Unhandled Rejection: ${err.message}`);
+  server.close(() => process.exit(1));
+});
+
+process.on('uncaughtException', (err) => {
+  console.error(`❌ Uncaught Exception: ${err.message}`);
+  process.exit(1);
 });
 
 export default app;

@@ -18,40 +18,124 @@ import {
   addLessonContent
 } from '../controllers/lectureController.js';
 
-import { protect } from '../middleware/authMiddleware.js';
-import { authorize } from '../middleware/roleMiddleware.js';
-import { uploadVideo, uploadResources, handleMulterError } from '../middleware/uploadMiddleware.js';
+import { protect }              from '../middleware/authMiddleware.js';
+import { authorize }            from '../middleware/roleMiddleware.js';
+import {
+  uploadVideo,
+  uploadResources,
+  handleMulterError,
+  wrapMulter,
+} from '../middleware/uploadMiddleware.js';
 
 const router = express.Router();
 
-// Apply protect middleware to all routes
+// ✅ All routes require auth
 router.use(protect);
 
-// Reorder (fixed path first - before :id routes)
-router.put('/reorder', authorize('instructor', 'admin'), reorderLectures);
+// ✅ MUST be before /:id routes
+router.put(
+  '/reorder',
+  authorize('instructor', 'admin'),
+  reorderLectures
+);
 
+// =============================================
 // CRUD
-router.post('/', authorize('instructor', 'admin'), createLecture);
+// =============================================
+router.post(
+  '/',
+  authorize('instructor', 'admin'),
+  createLecture
+);
+
 router.get('/:id', getLecture);
-router.put('/:id', authorize('instructor', 'admin'), updateLecture);
-router.delete('/:id', authorize('instructor', 'admin'), deleteLecture);
 
-// Content types
-router.put('/:id/video', authorize('instructor', 'admin'), uploadVideo, handleMulterError, uploadLectureVideo);
-router.put('/:id/youtube', authorize('instructor', 'admin'), addYouTubeVideo);
-router.put('/:id/article', authorize('instructor', 'admin'), addArticleContent);
-router.put('/:id/quiz', authorize('instructor', 'admin'), addQuiz);
-router.put('/:id/zoom', authorize('instructor', 'admin'), addZoomMeeting);
-router.put('/:id/interactive', authorize('instructor', 'admin'), addInteractiveContent);
-router.put('/:id/lesson', authorize('instructor', 'admin'), addLessonContent);
+router.put(
+  '/:id',
+  authorize('instructor', 'admin'),
+  updateLecture
+);
 
-// Watch settings (Instructor only)
-router.put('/:id/watch-settings', authorize('instructor', 'admin'), updateWatchSettings);
+router.delete(
+  '/:id',
+  authorize('instructor', 'admin'),
+  deleteLecture
+);
 
-// Resources
-router.post('/:id/resources', authorize('instructor', 'admin'), uploadResources, handleMulterError, addResources);
+// =============================================
+// CONTENT TYPES
+// =============================================
 
-// Publish
-router.patch('/:id/publish', authorize('instructor', 'admin'), toggleLecturePublish);
+// ✅ Video - uses wrapMulter to properly catch errors
+router.put(
+  '/:id/video',
+  authorize('instructor', 'admin'),
+  wrapMulter(uploadVideo),
+  uploadLectureVideo
+);
+
+router.put(
+  '/:id/youtube',
+  authorize('instructor', 'admin'),
+  addYouTubeVideo
+);
+
+router.put(
+  '/:id/article',
+  authorize('instructor', 'admin'),
+  addArticleContent
+);
+
+router.put(
+  '/:id/quiz',
+  authorize('instructor', 'admin'),
+  addQuiz
+);
+
+router.put(
+  '/:id/zoom',
+  authorize('instructor', 'admin'),
+  addZoomMeeting
+);
+
+router.put(
+  '/:id/interactive',
+  authorize('instructor', 'admin'),
+  addInteractiveContent
+);
+
+router.put(
+  '/:id/lesson',
+  authorize('instructor', 'admin'),
+  addLessonContent
+);
+
+// =============================================
+// SETTINGS
+// =============================================
+router.put(
+  '/:id/watch-settings',
+  authorize('instructor', 'admin'),
+  updateWatchSettings
+);
+
+// =============================================
+// RESOURCES
+// =============================================
+router.post(
+  '/:id/resources',
+  authorize('instructor', 'admin'),
+  wrapMulter(uploadResources),
+  addResources
+);
+
+// =============================================
+// PUBLISH
+// =============================================
+router.patch(
+  '/:id/publish',
+  authorize('instructor', 'admin'),
+  toggleLecturePublish
+);
 
 export default router;

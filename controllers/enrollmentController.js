@@ -1,38 +1,51 @@
 // controllers/enrollmentController.js
 import asyncHandler from 'express-async-handler';
+import mongoose from 'mongoose';
 import Enrollment from '../models/Enrollment.js';
 import Course from '../models/Course.js';
 import Lecture from '../models/Lecture.js';
-import Payment from '../models/Payment.js';
 import User from '../models/User.js';
 import { paginate, buildPaginationResponse } from '../utils/helpers.js';
 import { sendEnrollmentConfirmation } from '../utils/emailService.js';
+import { securityLog } from '../middleware/auditLog.js';
 
-// Helper function to merge overlapping segments
+// ✅ Validate ObjectId
+const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
+
+// ✅ Escape regex
+const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// ✅ Merge video segments helper
 const mergeSegments = (segments) => {
-  if (!segments || segments.length === 0) return [];
+  if (!segments?.length) return [];
   const sorted = [...segments].sort((a, b) => a.start - b.start);
   const merged = [{ ...sorted[0] }];
-
   for (let i = 1; i < sorted.length; i++) {
     const last = merged[merged.length - 1];
-    const current = sorted[i];
-    if (current.start <= last.end + 2) {
-      last.end = Math.max(last.end, current.end);
+    const cur = sorted[i];
+    if (cur.start <= last.end + 2) {
+      last.end = Math.max(last.end, cur.end);
     } else {
-      merged.push({ ...current });
+      merged.push({ ...cur });
     }
   }
   return merged;
 };
 
-// @desc    Enroll in a course (for free courses)
-// @route   POST /api/enrollments
-// @access  Private
+// =============================================
+// ENROLL IN COURSE (Free courses ONLY)
+// =============================================
 export const enrollInCourse = asyncHandler(async (req, res) => {
   const { courseId } = req.body;
 
-  const course = await Course.findById(courseId);
+  if (!courseId || !isValidId(courseId)) {
+    res.status(400);
+    throw new Error('Invalid course ID');
+  }
+
+  const course = await Course.findById(courseId)
+    .select('title price discountPrice isPublished isFreeCourse pricingType subscriptionPlans')
+    .lean();
 
   if (!course) {
     res.status(404);
@@ -44,84 +57,118 @@ export const enrollInCourse = asyncHandler(async (req, res) => {
     throw new Error('Course is not available for enrollment');
   }
 
+  // ✅ FIX: Only truly free courses can bypass payment
+  if (!course.isFreeCourse && course.pricingType !== 'free') {
+    res.status(400);
+    throw new Error(
+      course.pricingType === 'subscription'
+        ? 'This is a subscription course. Please submit payment to enroll.'
+        : 'This is a paid course. Please complete payment to enroll.'
+    );
+  }
+
+  // ✅ Check existing enrollment
   const existingEnrollment = await Enrollment.findOne({
     student: req.user._id,
     course: courseId
-  });
+  }).lean();
 
   if (existingEnrollment) {
-    res.status(400);
-    throw new Error('You are already enrolled in this course');
+    if (['active', 'completed'].includes(existingEnrollment.status)) {
+      res.status(400);
+      throw new Error('You are already enrolled in this course');
+    }
+    // Reactivate cancelled enrollment
+    if (existingEnrollment.status === 'cancelled') {
+      await Enrollment.findByIdAndUpdate(existingEnrollment._id, {
+        status: 'active',
+        paymentStatus: 'paid'
+      });
+      return res.json({
+        success: true,
+        message: 'Enrollment reactivated successfully'
+      });
+    }
   }
 
-  if (course.isFreeCourse || course.price === 0) {
-    const enrollment = await Enrollment.create({
-      student: req.user._id,
-      course: courseId,
-      status: 'active',
-      paymentStatus: 'paid',
-      lectureProgress: [],
-      codeSubmissions: [],
-      zoomAttendance: [],
-      bookmarks: [],
-      stats: {
-        totalWatchTime: 0,
-        totalTimeSpent: 0,
-        streakDays: 0,
-        longestStreak: 0
-      }
-    });
+  const enrollment = await Enrollment.create({
+    student: req.user._id,
+    course: courseId,
+    status: 'active',
+    paymentStatus: 'paid',
+    lectureProgress: [],
+    codeSubmissions: [],
+    zoomAttendance: [],
+    bookmarks: [],
+    stats: {
+      totalWatchTime: 0,
+      totalTimeSpent: 0,
+      streakDays: 0,
+      longestStreak: 0
+    }
+  });
 
-    course.enrollmentCount += 1;
-    await course.save();
+  await Course.findByIdAndUpdate(courseId, {
+    $inc: { enrollmentCount: 1 }
+  });
 
-    await User.findByIdAndUpdate(req.user._id, {
-      $addToSet: { enrolledCourses: courseId }
-    });
+  await User.findByIdAndUpdate(req.user._id, {
+    $addToSet: { enrolledCourses: courseId }
+  });
 
+  setImmediate(async () => {
     try {
       await sendEnrollmentConfirmation(req.user, course);
-    } catch (error) {
-      console.error('Failed to send enrollment email:', error);
+    } catch (err) {
+      console.error('Enrollment email failed:', err.message);
     }
+  });
 
-    res.status(201).json({
-      success: true,
-      data: enrollment,
-      message: 'Successfully enrolled in the course'
-    });
-  } else {
-    res.status(400);
-    throw new Error('This is a paid course. Please make a payment to enroll.');
-  }
+  securityLog('COURSE_ENROLLED', {
+    userId: req.user._id,
+    courseId,
+    type: 'free',
+    ip: req.ip
+  });
+
+  res.status(201).json({
+    success: true,
+    data: enrollment,
+    message: 'Successfully enrolled in the course! 🎉'
+  });
 });
 
-// @desc    Get my enrollments
-// @route   GET /api/enrollments/my-enrollments
-// @access  Private
+// =============================================
+// GET MY ENROLLMENTS
+// =============================================
 export const getMyEnrollments = asyncHandler(async (req, res) => {
   const { page, limit, skip } = paginate(req.query.page, req.query.limit);
   const { status } = req.query;
 
   const query = { student: req.user._id };
 
-  if (status && status !== 'all') {
+  const validStatuses = ['pending', 'active', 'completed', 'expired', 'cancelled'];
+  if (status && status !== 'all' && validStatuses.includes(status)) {
     query.status = status;
   }
 
-  const total = await Enrollment.countDocuments(query);
-  const enrollments = await Enrollment.find(query)
-    .populate({
-      path: 'course',
-      select: 'title slug thumbnail instructor duration totalLectures',
-      populate: {
-        path: 'instructor',
-        select: 'firstName lastName'
-      }
-    })
-    .sort({ createdAt: -1 })
-    .skip(skip)
-    .limit(limit);
+  const [total, enrollments] = await Promise.all([
+    Enrollment.countDocuments(query),
+    Enrollment.find(query)
+      .populate({
+        path: 'course',
+        select: 'title slug thumbnail instructor duration totalLectures pricingType subscriptionPlans',
+        populate: {
+          path: 'instructor',
+          select: 'firstName lastName avatar'
+        }
+      })
+      .select('-lectureProgress -codeSubmissions -zoomAttendance -bookmarks')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean()
+  ]);
 
   res.json({
     success: true,
@@ -130,10 +177,15 @@ export const getMyEnrollments = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Get enrollment details
-// @route   GET /api/enrollments/:id
-// @access  Private
+// =============================================
+// GET SINGLE ENROLLMENT
+// =============================================
 export const getEnrollment = asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.id)) {
+    res.status(400);
+    throw new Error('Invalid enrollment ID');
+  }
+
   const enrollment = await Enrollment.findById(req.params.id)
     .populate({
       path: 'course',
@@ -154,7 +206,7 @@ export const getEnrollment = asyncHandler(async (req, res) => {
     req.user.role !== 'admin'
   ) {
     res.status(403);
-    throw new Error('Not authorized');
+    throw new Error('Not authorized to view this enrollment');
   }
 
   res.json({
@@ -163,37 +215,137 @@ export const getEnrollment = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Get all enrollments (Admin)
-// @route   GET /api/enrollments/admin/all
-// @access  Private/Admin
+// =============================================
+// ✅ CHECK ENROLLMENT STATUS - FIXED
+// =============================================
+export const checkEnrollment = asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.courseId)) {
+    res.status(400);
+    throw new Error('Invalid course ID');
+  }
+
+  const enrollment = await Enrollment.findOne({
+    student: req.user._id,
+    course: req.params.courseId
+  }).select(
+    'status progress certificateIssued certificateId subscriptionExpiry isPermanentlyUnlocked subscriptionMonthsPaid paymentStatus'
+  );
+
+  if (!enrollment) {
+    return res.json({
+      success: true,
+      data: {
+        isEnrolled: false,
+        enrollment: null,
+        subscriptionExpired: false
+      }
+    });
+  }
+
+  // ✅ Must be active or completed AND payment must be paid
+  const hasActiveStatus = ['active', 'completed'].includes(enrollment.status);
+  const hasPaidPayment = enrollment.paymentStatus === 'paid';
+
+  // ✅ Check subscription expiry
+  let subscriptionActive = true;
+  let subscriptionExpired = false;
+
+  if (
+    hasActiveStatus &&
+    enrollment.subscriptionExpiry &&
+    !enrollment.isPermanentlyUnlocked
+  ) {
+    subscriptionActive = new Date(enrollment.subscriptionExpiry) > new Date();
+    subscriptionExpired = !subscriptionActive;
+  }
+
+  const isEnrolled = hasActiveStatus && hasPaidPayment && subscriptionActive;
+
+  res.json({
+    success: true,
+    data: {
+      isEnrolled,
+      enrollment: enrollment || null,
+      subscriptionExpired,
+      isPermanentlyUnlocked: enrollment?.isPermanentlyUnlocked || false,
+      subscriptionMonthsPaid: enrollment?.subscriptionMonthsPaid || 0,
+      subscriptionExpiry: enrollment?.subscriptionExpiry || null
+    }
+  });
+});
+
+// =============================================
+// ADMIN: GET ALL ENROLLMENTS
+// =============================================
 export const getAllEnrollments = asyncHandler(async (req, res) => {
   const { page, limit, skip } = paginate(req.query.page, req.query.limit);
-  const { status, paymentStatus, course, student, search } = req.query;
+  const { status, paymentStatus, courseId, studentId, search } = req.query;
 
   const query = {};
 
-  if (status && status !== 'all') query.status = status;
-  if (paymentStatus && paymentStatus !== 'all') query.paymentStatus = paymentStatus;
-  if (course) query.course = course;
-  if (student) query.student = student;
-
-  const total = await Enrollment.countDocuments(query);
-  let enrollments = await Enrollment.find(query)
-    .populate('student', 'firstName lastName email')
-    .populate('course', 'title slug price')
-    .populate('payment', 'paymentId status amount')
-    .sort({ createdAt: -1 })
-    .skip(skip)
-    .limit(limit);
-
-  if (search) {
-    enrollments = enrollments.filter(e => 
-      e.student.firstName.toLowerCase().includes(search.toLowerCase()) ||
-      e.student.lastName.toLowerCase().includes(search.toLowerCase()) ||
-      e.student.email.toLowerCase().includes(search.toLowerCase()) ||
-      e.course.title.toLowerCase().includes(search.toLowerCase())
-    );
+  const validStatuses = ['pending', 'active', 'completed', 'expired', 'cancelled'];
+  if (status && status !== 'all' && validStatuses.includes(status)) {
+    query.status = status;
   }
+
+  const validPaymentStatuses = ['pending', 'paid', 'failed', 'refunded'];
+  if (paymentStatus && paymentStatus !== 'all' && validPaymentStatuses.includes(paymentStatus)) {
+    query.paymentStatus = paymentStatus;
+  }
+
+  if (courseId && isValidId(courseId)) {
+    query.course = new mongoose.Types.ObjectId(courseId);
+  }
+
+  if (studentId && isValidId(studentId)) {
+    query.student = new mongoose.Types.ObjectId(studentId);
+  }
+
+  if (search?.trim()) {
+    const escaped = escapeRegex(search.trim());
+    const searchRegex = new RegExp(escaped, 'i');
+
+    const matchingUsers = await User.find({
+      $or: [
+        { firstName: searchRegex },
+        { lastName: searchRegex },
+        { email: searchRegex }
+      ]
+    }).select('_id').lean();
+
+    const matchingCourses = await Course.find({
+      title: searchRegex
+    }).select('_id').lean();
+
+    const userIds = matchingUsers.map(u => u._id);
+    const courseIds = matchingCourses.map(c => c._id);
+
+    if (userIds.length === 0 && courseIds.length === 0) {
+      return res.json({
+        success: true,
+        data: [],
+        pagination: buildPaginationResponse(0, page, limit)
+      });
+    }
+
+    query.$or = [
+      ...(userIds.length > 0 ? [{ student: { $in: userIds } }] : []),
+      ...(courseIds.length > 0 ? [{ course: { $in: courseIds } }] : [])
+    ];
+  }
+
+  const [total, enrollments] = await Promise.all([
+    Enrollment.countDocuments(query),
+    Enrollment.find(query)
+      .populate('student', 'firstName lastName email avatar')
+      .populate('course', 'title slug price pricingType')
+      .populate('payment', 'paymentId status amount')
+      .select('-lectureProgress -codeSubmissions -zoomAttendance -bookmarks')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean()
+  ]);
 
   res.json({
     success: true,
@@ -202,11 +354,22 @@ export const getAllEnrollments = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Update enrollment status (Admin)
-// @route   PUT /api/enrollments/:id/status
-// @access  Private/Admin
+// =============================================
+// ADMIN: UPDATE ENROLLMENT STATUS
+// =============================================
 export const updateEnrollmentStatus = asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.id)) {
+    res.status(400);
+    throw new Error('Invalid enrollment ID');
+  }
+
   const { status, notes } = req.body;
+
+  const validStatuses = ['pending', 'active', 'completed', 'expired', 'cancelled'];
+  if (!status || !validStatuses.includes(status)) {
+    res.status(400);
+    throw new Error('Invalid status value');
+  }
 
   const enrollment = await Enrollment.findById(req.params.id);
 
@@ -217,23 +380,39 @@ export const updateEnrollmentStatus = asyncHandler(async (req, res) => {
 
   enrollment.status = status;
   if (notes) enrollment.notes = notes;
-  if (status === 'completed') enrollment.completedAt = new Date();
+  if (status === 'completed' && !enrollment.completedAt) {
+    enrollment.completedAt = new Date();
+  }
 
   await enrollment.save();
 
+  securityLog('ENROLLMENT_STATUS_UPDATED', {
+    adminId: req.user._id,
+    enrollmentId: enrollment._id,
+    newStatus: status,
+    ip: req.ip
+  });
+
   res.json({
     success: true,
-    data: enrollment
+    data: enrollment,
+    message: `Enrollment ${status} successfully`
   });
 });
 
-// @desc    Get course enrollments (Instructor)
-// @route   GET /api/enrollments/course/:courseId
-// @access  Private/Instructor
+// =============================================
+// INSTRUCTOR: GET COURSE ENROLLMENTS
+// =============================================
 export const getCourseEnrollments = asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.courseId)) {
+    res.status(400);
+    throw new Error('Invalid course ID');
+  }
+
   const { page, limit, skip } = paginate(req.query.page, req.query.limit);
 
-  const course = await Course.findById(req.params.courseId);
+  const course = await Course.findById(req.params.courseId)
+    .select('instructor title').lean();
 
   if (!course) {
     res.status(404);
@@ -245,17 +424,24 @@ export const getCourseEnrollments = asyncHandler(async (req, res) => {
     req.user.role !== 'admin'
   ) {
     res.status(403);
-    throw new Error('Not authorized');
+    throw new Error('Not authorized to view these enrollments');
   }
 
-  const query = { course: req.params.courseId };
-  const total = await Enrollment.countDocuments(query);
+  const query = {
+    course: req.params.courseId,
+    status: { $in: ['active', 'completed'] }
+  };
 
-  const enrollments = await Enrollment.find(query)
-    .populate('student', 'firstName lastName email avatar')
-    .sort({ createdAt: -1 })
-    .skip(skip)
-    .limit(limit);
+  const [total, enrollments] = await Promise.all([
+    Enrollment.countDocuments(query),
+    Enrollment.find(query)
+      .populate('student', 'firstName lastName email avatar')
+      .select('student status progress stats enrollmentDate completedAt')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean()
+  ]);
 
   res.json({
     success: true,
@@ -264,33 +450,25 @@ export const getCourseEnrollments = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Check enrollment status
-// @route   GET /api/enrollments/check/:courseId
-// @access  Private
-export const checkEnrollment = asyncHandler(async (req, res) => {
-  const enrollment = await Enrollment.findOne({
-    student: req.user._id,
-    course: req.params.courseId
-  });
-
-  res.json({
-    success: true,
-    data: {
-      isEnrolled: !!enrollment && ['active', 'completed'].includes(enrollment.status),
-      enrollment: enrollment || null
-    }
-  });
-});
-
-// @desc    Cancel enrollment
-// @route   DELETE /api/enrollments/:id
-// @access  Private/Admin
+// =============================================
+// ADMIN: CANCEL ENROLLMENT
+// =============================================
 export const cancelEnrollment = asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.id)) {
+    res.status(400);
+    throw new Error('Invalid enrollment ID');
+  }
+
   const enrollment = await Enrollment.findById(req.params.id);
 
   if (!enrollment) {
     res.status(404);
     throw new Error('Enrollment not found');
+  }
+
+  if (enrollment.status === 'cancelled') {
+    res.status(400);
+    throw new Error('Enrollment is already cancelled');
   }
 
   enrollment.status = 'cancelled';
@@ -304,40 +482,51 @@ export const cancelEnrollment = asyncHandler(async (req, res) => {
     $pull: { enrolledCourses: enrollment.course }
   });
 
+  securityLog('ENROLLMENT_CANCELLED', {
+    adminId: req.user._id,
+    enrollmentId: enrollment._id,
+    studentId: enrollment.student,
+    courseId: enrollment.course,
+    ip: req.ip
+  });
+
   res.json({
     success: true,
     message: 'Enrollment cancelled successfully'
   });
 });
 
-// ============================================
-// NEW: WATCH TRACKING & PROGRESS FUNCTIONS
-// ============================================
-
-// @desc    Get course progress
-// @route   GET /api/enrollments/progress/:courseId
-// @access  Private
+// =============================================
+// GET COURSE PROGRESS
+// =============================================
 export const getCourseProgress = asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.courseId)) {
+    res.status(400);
+    throw new Error('Invalid course ID');
+  }
+
   const enrollment = await Enrollment.findOne({
     student: req.user._id,
     course: req.params.courseId,
     status: { $in: ['active', 'completed'] }
-  }).populate('lectureProgress.lecture', 'title contentType duration watchSettings');
+  }).populate('lectureProgress.lecture', 'title contentType duration');
 
   if (!enrollment) {
     res.status(404);
     throw new Error('Enrollment not found');
   }
 
-  const totalLectures = await Lecture.countDocuments({ 
+  const totalLectures = await Lecture.countDocuments({
     course: req.params.courseId,
-    isPublished: true 
+    isPublished: true
   });
 
   const completedCount = enrollment.lectureProgress.filter(p => p.isCompleted).length;
   const legacyCompleted = enrollment.progress?.completedLectures?.length || 0;
   const actualCompleted = Math.max(completedCount, legacyCompleted);
-  const percentage = totalLectures > 0 ? Math.round((actualCompleted / totalLectures) * 100) : 0;
+  const percentage = totalLectures > 0
+    ? Math.round((actualCompleted / totalLectures) * 100)
+    : 0;
 
   res.json({
     success: true,
@@ -353,7 +542,6 @@ export const getCourseProgress = asyncHandler(async (req, res) => {
       },
       stats: enrollment.stats,
       bookmarks: enrollment.bookmarks,
-      // Include legacy progress for compatibility
       legacyProgress: {
         completedLectures: enrollment.progress?.completedLectures || [],
         percentage: enrollment.progress?.percentage || 0
@@ -362,12 +550,17 @@ export const getCourseProgress = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Get lecture watch progress
-// @route   GET /api/enrollments/lecture-progress/:lectureId
-// @access  Private
+// =============================================
+// GET LECTURE WATCH PROGRESS
+// =============================================
 export const getLectureWatchProgress = asyncHandler(async (req, res) => {
-  const lecture = await Lecture.findById(req.params.lectureId);
-  
+  if (!isValidId(req.params.lectureId)) {
+    res.status(400);
+    throw new Error('Invalid lecture ID');
+  }
+
+  const lecture = await Lecture.findById(req.params.lectureId).lean();
+
   if (!lecture) {
     res.status(404);
     throw new Error('Lecture not found');
@@ -376,12 +569,12 @@ export const getLectureWatchProgress = asyncHandler(async (req, res) => {
   const enrollment = await Enrollment.findOne({
     student: req.user._id,
     course: lecture.course,
-    status: 'active'
+    status: { $in: ['active', 'completed'] }
   });
 
   if (!enrollment) {
     res.status(403);
-    throw new Error('Not enrolled in this course');
+    throw new Error('You are not enrolled in this course');
   }
 
   const progress = enrollment.getLectureProgress(lecture._id);
@@ -393,156 +586,240 @@ export const getLectureWatchProgress = asyncHandler(async (req, res) => {
     data: {
       lastPosition: progress?.lastPosition || 0,
       totalWatchTime: progress?.totalWatchTime || 0,
-      watchCount: watchCount,
+      watchCount,
       isCompleted: progress?.isCompleted || false,
       completedAt: progress?.completedAt,
       watchedSegments: progress?.watchedSegments || [],
       canWatch: maxWatches === 0 || watchCount < maxWatches,
       remainingWatches: maxWatches > 0 ? Math.max(0, maxWatches - watchCount) : -1,
-      watchSettings: lecture.watchSettings,
       personalNotes: progress?.personalNotes || ''
     }
   });
 });
 
-// @desc    Start watching (increment watch count)
-// @route   POST /api/enrollments/start-watch/:lectureId
-// @access  Private
+// =============================================
+// START WATCH
+// =============================================
 export const startWatch = asyncHandler(async (req, res) => {
-  const lecture = await Lecture.findById(req.params.lectureId);
+  if (!isValidId(req.params.lectureId)) {
+    res.status(400);
+    throw new Error('Invalid lecture ID');
+  }
+
+  const lecture = await Lecture.findById(req.params.lectureId).lean();
 
   if (!lecture) {
     res.status(404);
     throw new Error('Lecture not found');
   }
 
+  // ✅ FIX: Accept both active AND completed enrollments
   const enrollment = await Enrollment.findOne({
     student: req.user._id,
-    course: lecture.course,
-    status: 'active'
+    course:  lecture.course,
+    status:  { $in: ['active', 'completed'] },
   });
 
-  if (!enrollment) {
+  // ✅ FIX: Preview lectures don't need enrollment
+  if (!enrollment && !lecture.isPreview) {
     res.status(403);
-    throw new Error('Not enrolled in this course');
+    throw new Error('You are not enrolled in this course');
   }
 
+  // ✅ If preview lecture and no enrollment - return mock data
+  if (!enrollment && lecture.isPreview) {
+    return res.json({
+      success: true,
+      data: {
+        watchCount:       1,
+        canWatch:         true,
+        remainingWatches: -1,
+      },
+    });
+  }
+
+  // ✅ Find or create lecture progress entry
   let progressIndex = enrollment.lectureProgress.findIndex(
-    p => p.lecture.toString() === lecture._id.toString()
+    (p) => p.lecture.toString() === lecture._id.toString()
   );
 
   if (progressIndex === -1) {
     enrollment.lectureProgress.push({
-      lecture: lecture._id,
-      watchCount: 0,
-      totalWatchTime: 0,
-      lastPosition: 0,
-      lastWatchedAt: new Date(),
-      isCompleted: false,
-      watchedSegments: []
+      lecture:         lecture._id,
+      watchCount:      0,
+      totalWatchTime:  0,
+      lastPosition:    0,
+      lastWatchedAt:   new Date(),
+      isCompleted:     false,
+      watchedSegments: [],
     });
     progressIndex = enrollment.lectureProgress.length - 1;
   }
 
-  const progress = enrollment.lectureProgress[progressIndex];
-  const maxWatches = lecture.watchSettings?.maxWatches || 0;
+  const progress    = enrollment.lectureProgress[progressIndex];
+  const maxWatches  = lecture.watchSettings?.maxWatches || 0;
+  const watchCount  = progress.watchCount || 0;
 
-  if (maxWatches > 0 && progress.watchCount >= maxWatches) {
+  // ✅ Check watch limit
+  if (maxWatches > 0 && watchCount >= maxWatches) {
     res.status(403);
     throw new Error('Maximum watch limit reached for this lecture');
   }
 
-  progress.watchCount += 1;
+  // ✅ Increment watch count
+  progress.watchCount   += 1;
   progress.lastWatchedAt = new Date();
-  
-  enrollment.updateStreak();
+
+  // ✅ Update streak safely
+  try {
+    enrollment.updateStreak();
+  } catch (e) {
+    // Silent fail - don't break watch
+  }
+
+  enrollment.progress        = enrollment.progress || {};
   enrollment.progress.currentLecture = lecture._id;
-  enrollment.progress.lastAccessed = new Date();
-  
+  enrollment.progress.lastAccessed   = new Date();
+
   await enrollment.save();
+
+  const newCount = progress.watchCount;
 
   res.json({
     success: true,
     data: {
-      watchCount: progress.watchCount,
-      canWatch: maxWatches === 0 || progress.watchCount < maxWatches,
-      remainingWatches: maxWatches > 0 ? Math.max(0, maxWatches - progress.watchCount) : -1
-    }
+      watchCount:       newCount,
+      canWatch:         maxWatches === 0 || newCount < maxWatches,
+      remainingWatches: maxWatches > 0
+        ? Math.max(0, maxWatches - newCount)
+        : -1,
+    },
   });
 });
 
-// @desc    Update watch progress
-// @route   POST /api/enrollments/watch-progress/:lectureId
-// @access  Private
+// =============================================
+// UPDATE WATCH PROGRESS
+// =============================================
 export const updateWatchProgress = asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.lectureId)) {
+    res.status(400);
+    throw new Error('Invalid lecture ID');
+  }
+
   const { currentTime, duration, watchedSegment } = req.body;
 
-  const lecture = await Lecture.findById(req.params.lectureId);
+  // ✅ Safe number parsing
+  const safeCurrentTime = Math.max(0, Number(currentTime) || 0);
+  const safeDuration    = Math.max(0, Number(duration)    || 0);
+
+  const lecture = await Lecture.findById(req.params.lectureId).lean();
 
   if (!lecture) {
     res.status(404);
     throw new Error('Lecture not found');
   }
 
+  // ✅ FIX: Accept active AND completed
   const enrollment = await Enrollment.findOne({
     student: req.user._id,
-    course: lecture.course,
-    status: 'active'
+    course:  lecture.course,
+    status:  { $in: ['active', 'completed'] },
   });
 
+  // ✅ FIX: Don't throw for preview - just return ok
   if (!enrollment) {
+    if (lecture.isPreview) {
+      return res.json({
+        success:  true,
+        data: {
+          lastPosition:   safeCurrentTime,
+          totalWatchTime: 0,
+          watchCount:     0,
+          isCompleted:    false,
+        },
+      });
+    }
     res.status(403);
-    throw new Error('Not enrolled in this course');
+    throw new Error('You are not enrolled in this course');
   }
 
+  // ✅ Find or create progress entry
   let progressIndex = enrollment.lectureProgress.findIndex(
-    p => p.lecture.toString() === lecture._id.toString()
+    (p) => p.lecture.toString() === lecture._id.toString()
   );
 
   if (progressIndex === -1) {
     enrollment.lectureProgress.push({
-      lecture: lecture._id,
-      watchCount: 1,
-      totalWatchTime: 0,
-      lastPosition: 0,
-      lastWatchedAt: new Date(),
-      isCompleted: false,
-      watchedSegments: []
+      lecture:         lecture._id,
+      watchCount:      1,
+      totalWatchTime:  0,
+      lastPosition:    0,
+      lastWatchedAt:   new Date(),
+      isCompleted:     false,
+      watchedSegments: [],
     });
     progressIndex = enrollment.lectureProgress.length - 1;
   }
 
-  const progress = enrollment.lectureProgress[progressIndex];
-
+  const progress   = enrollment.lectureProgress[progressIndex];
   const maxWatches = lecture.watchSettings?.maxWatches || 0;
-  if (maxWatches > 0 && progress.watchCount > maxWatches) {
+
+  // ✅ Check watch limit
+  if (maxWatches > 0 && (progress.watchCount || 0) > maxWatches) {
     res.status(403);
     throw new Error('Maximum watch limit reached');
   }
 
-  progress.lastPosition = currentTime || 0;
+  // ✅ Update position
+  progress.lastPosition  = safeCurrentTime;
   progress.lastWatchedAt = new Date();
-  progress.totalWatchTime = (progress.totalWatchTime || 0) + 1;
 
-  enrollment.stats = enrollment.stats || {};
-  enrollment.stats.totalWatchTime = (enrollment.stats.totalWatchTime || 0) + 1;
-  enrollment.stats.totalTimeSpent = (enrollment.stats.totalTimeSpent || 0) + 1;
+  // ✅ Increment watch time safely
+  progress.totalWatchTime = (progress.totalWatchTime || 0) + 5;
 
-  if (watchedSegment && watchedSegment.start !== undefined && watchedSegment.end !== undefined) {
-    const existingSegments = progress.watchedSegments || [];
-    progress.watchedSegments = mergeSegments([
-      ...existingSegments,
-      { start: watchedSegment.start, end: watchedSegment.end }
-    ]);
+  enrollment.stats                    = enrollment.stats || {};
+  enrollment.stats.totalWatchTime     = (enrollment.stats.totalWatchTime || 0) + 5;
+  enrollment.stats.totalTimeSpent     = (enrollment.stats.totalTimeSpent || 0) + 5;
+  enrollment.stats.lastActivityAt     = new Date();
+
+  // ✅ Add watched segment
+  if (
+    watchedSegment &&
+    typeof watchedSegment.start === 'number' &&
+    typeof watchedSegment.end   === 'number' &&
+    watchedSegment.start >= 0 &&
+    watchedSegment.end > watchedSegment.start &&
+    watchedSegment.end - watchedSegment.start <= 3600
+  ) {
+    const existing = progress.watchedSegments || [];
+
+    // ✅ Limit segments to prevent DB bloat
+    if (existing.length < 500) {
+      progress.watchedSegments = mergeSegments([
+        ...existing,
+        {
+          start: Math.floor(watchedSegment.start),
+          end:   Math.ceil(watchedSegment.end),
+        },
+      ]);
+    }
   }
 
-  if (duration && currentTime && !progress.isCompleted) {
-    const watchedPercentage = (currentTime / duration) * 100;
-    if (watchedPercentage >= 90) {
-      progress.isCompleted = true;
-      progress.completedAt = new Date();
-      
-      if (!enrollment.progress.completedLectures.includes(lecture._id)) {
+  // ✅ Auto-complete at 90%
+  if (
+    safeDuration > 0 &&
+    safeCurrentTime > 0 &&
+    !progress.isCompleted
+  ) {
+    const watchedPct = (safeCurrentTime / safeDuration) * 100;
+    if (watchedPct >= 90) {
+      progress.isCompleted  = true;
+      progress.completedAt  = new Date();
+
+      const alreadyCompleted = enrollment.progress.completedLectures.some(
+        (id) => id.toString() === lecture._id.toString()
+      );
+      if (!alreadyCompleted) {
         enrollment.progress.completedLectures.push(lecture._id);
       }
     }
@@ -553,74 +830,95 @@ export const updateWatchProgress = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     data: {
-      lastPosition: progress.lastPosition,
+      lastPosition:   progress.lastPosition,
       totalWatchTime: progress.totalWatchTime,
-      watchCount: progress.watchCount,
-      isCompleted: progress.isCompleted,
-      canWatch: maxWatches === 0 || progress.watchCount <= maxWatches
-    }
+      watchCount:     progress.watchCount,
+      isCompleted:    progress.isCompleted,
+    },
   });
 });
 
-// @desc    Mark lecture as complete
-// @route   POST /api/enrollments/complete/:lectureId
-// @access  Private
+// =============================================
+// MARK LECTURE COMPLETE
+// =============================================
 export const markLectureComplete = asyncHandler(async (req, res) => {
-  const lecture = await Lecture.findById(req.params.lectureId);
+  if (!isValidId(req.params.lectureId)) {
+    res.status(400);
+    throw new Error('Invalid lecture ID');
+  }
+
+  const lecture = await Lecture.findById(req.params.lectureId).lean();
 
   if (!lecture) {
     res.status(404);
     throw new Error('Lecture not found');
   }
 
+  // ✅ FIX: Accept active AND completed enrollments
   const enrollment = await Enrollment.findOne({
     student: req.user._id,
-    course: lecture.course,
-    status: 'active'
+    course:  lecture.course,
+    status:  { $in: ['active', 'completed'] },
   });
 
   if (!enrollment) {
     res.status(403);
-    throw new Error('Not enrolled in this course');
+    throw new Error('You are not enrolled in this course');
   }
 
+  // ✅ Find or create progress
   let progressIndex = enrollment.lectureProgress.findIndex(
-    p => p.lecture.toString() === lecture._id.toString()
+    (p) => p.lecture.toString() === lecture._id.toString()
   );
 
   if (progressIndex === -1) {
     enrollment.lectureProgress.push({
-      lecture: lecture._id,
-      watchCount: 0,
-      totalWatchTime: 0,
-      lastPosition: 0,
-      lastWatchedAt: new Date(),
-      isCompleted: true,
-      completedAt: new Date(),
-      watchedSegments: []
+      lecture:         lecture._id,
+      watchCount:      0,
+      totalWatchTime:  0,
+      lastPosition:    0,
+      lastWatchedAt:   new Date(),
+      isCompleted:     true,
+      completedAt:     new Date(),
+      watchedSegments: [],
     });
   } else {
-    enrollment.lectureProgress[progressIndex].isCompleted = true;
-    enrollment.lectureProgress[progressIndex].completedAt = new Date();
+    if (!enrollment.lectureProgress[progressIndex].isCompleted) {
+      enrollment.lectureProgress[progressIndex].isCompleted = true;
+      enrollment.lectureProgress[progressIndex].completedAt = new Date();
+    }
   }
 
-  // Sync with legacy progress
-  if (!enrollment.progress.completedLectures.includes(lecture._id)) {
+  // ✅ Add to legacy completedLectures array
+  const alreadyInLegacy = enrollment.progress.completedLectures.some(
+    (id) => id.toString() === lecture._id.toString()
+  );
+  if (!alreadyInLegacy) {
     enrollment.progress.completedLectures.push(lecture._id);
   }
 
+  // ✅ Recalculate percentage
   const totalLectures = await Lecture.countDocuments({
-    course: lecture.course,
-    isPublished: true
+    course:      lecture.course,
+    isPublished: true,
   });
-  
-  enrollment.progress.percentage = enrollment.calculateProgress(totalLectures);
-  enrollment.progress.lastAccessed = new Date();
-  
-  enrollment.updateStreak();
 
-  if (enrollment.progress.percentage >= 100) {
-    enrollment.status = 'completed';
+  enrollment.progress.percentage  = enrollment.calculateProgress(totalLectures);
+  enrollment.progress.lastAccessed = new Date();
+
+  // ✅ Update streak safely
+  try {
+    enrollment.updateStreak();
+  } catch (e) {
+    // Silent fail
+  }
+
+  // ✅ Auto-complete course at 100%
+  if (
+    enrollment.progress.percentage >= 100 &&
+    enrollment.status === 'active'
+  ) {
+    enrollment.status      = 'completed';
     enrollment.completedAt = new Date();
   }
 
@@ -629,20 +927,24 @@ export const markLectureComplete = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     data: {
-      isCompleted: true,
-      progress: enrollment.progress.percentage,
-      courseCompleted: enrollment.status === 'completed'
-    }
+      isCompleted:   true,
+      percentage:    enrollment.progress.percentage,
+      courseCompleted: enrollment.status === 'completed',
+    },
   });
 });
 
-// @desc    Submit code for interactive lecture
-// @route   POST /api/enrollments/submit-code/:lectureId
-// @access  Private
+// =============================================
+// SUBMIT CODE
+// =============================================
 export const submitCode = asyncHandler(async (req, res) => {
-  const { html, css, js } = req.body;
+  if (!isValidId(req.params.lectureId)) {
+    res.status(400);
+    throw new Error('Invalid lecture ID');
+  }
 
-  const lecture = await Lecture.findById(req.params.lectureId);
+  const { html, css, js } = req.body;
+  const lecture = await Lecture.findById(req.params.lectureId).lean();
 
   if (!lecture) {
     res.status(404);
@@ -662,34 +964,42 @@ export const submitCode = asyncHandler(async (req, res) => {
 
   if (!enrollment) {
     res.status(403);
-    throw new Error('Not enrolled in this course');
+    throw new Error('You are not enrolled in this course');
   }
 
   enrollment.codeSubmissions.push({
     lecture: lecture._id,
-    code: { html: html || '', css: css || '', js: js || '' },
+    code: {
+      html: String(html || '').substring(0, 50000),
+      css: String(css || '').substring(0, 20000),
+      js: String(js || '').substring(0, 50000)
+    },
     submittedAt: new Date()
   });
 
   enrollment.updateStreak();
   await enrollment.save();
 
+  const submission = enrollment.codeSubmissions[enrollment.codeSubmissions.length - 1];
+
   res.json({
     success: true,
     message: 'Code submitted successfully',
-    data: {
-      submissionId: enrollment.codeSubmissions[enrollment.codeSubmissions.length - 1]._id
-    }
+    data: { submissionId: submission._id }
   });
 });
 
-// @desc    Record Zoom attendance
-// @route   POST /api/enrollments/zoom-attendance/:lectureId
-// @access  Private
+// =============================================
+// RECORD ZOOM ATTENDANCE
+// =============================================
 export const recordZoomAttendance = asyncHandler(async (req, res) => {
-  const { joinedAt, leftAt } = req.body;
+  if (!isValidId(req.params.lectureId)) {
+    res.status(400);
+    throw new Error('Invalid lecture ID');
+  }
 
-  const lecture = await Lecture.findById(req.params.lectureId);
+  const { joinedAt, leftAt } = req.body;
+  const lecture = await Lecture.findById(req.params.lectureId).lean();
 
   if (!lecture) {
     res.status(404);
@@ -719,7 +1029,9 @@ export const recordZoomAttendance = asyncHandler(async (req, res) => {
   };
 
   if (leftAt && joinedAt) {
-    attendanceData.duration = Math.round((new Date(leftAt) - new Date(joinedAt)) / 60000);
+    attendanceData.duration = Math.round(
+      (new Date(leftAt) - new Date(joinedAt)) / 60000
+    );
   }
 
   if (attendanceIndex === -1) {
@@ -732,17 +1044,21 @@ export const recordZoomAttendance = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    message: 'Attendance recorded'
+    message: 'Attendance recorded successfully'
   });
 });
 
-// @desc    Add bookmark
-// @route   POST /api/enrollments/bookmark/:lectureId
-// @access  Private
+// =============================================
+// ADD BOOKMARK
+// =============================================
 export const addBookmark = asyncHandler(async (req, res) => {
-  const { timestamp, note } = req.body;
+  if (!isValidId(req.params.lectureId)) {
+    res.status(400);
+    throw new Error('Invalid lecture ID');
+  }
 
-  const lecture = await Lecture.findById(req.params.lectureId);
+  const { timestamp, note } = req.body;
+  const lecture = await Lecture.findById(req.params.lectureId).lean();
 
   if (!lecture) {
     res.status(404);
@@ -752,7 +1068,7 @@ export const addBookmark = asyncHandler(async (req, res) => {
   const enrollment = await Enrollment.findOne({
     student: req.user._id,
     course: lecture.course,
-    status: 'active'
+    status: { $in: ['active', 'completed'] }
   });
 
   if (!enrollment) {
@@ -760,25 +1076,37 @@ export const addBookmark = asyncHandler(async (req, res) => {
     throw new Error('Not enrolled in this course');
   }
 
+  if (enrollment.bookmarks.length >= 100) {
+    res.status(400);
+    throw new Error('Maximum 100 bookmarks allowed');
+  }
+
   enrollment.bookmarks.push({
     lecture: lecture._id,
-    timestamp: timestamp || 0,
-    note: note || '',
+    timestamp: Math.max(0, Number(timestamp) || 0),
+    note: String(note || '').substring(0, 500),
     createdAt: new Date()
   });
 
   await enrollment.save();
 
+  const bookmark = enrollment.bookmarks[enrollment.bookmarks.length - 1];
+
   res.json({
     success: true,
-    data: enrollment.bookmarks[enrollment.bookmarks.length - 1]
+    data: bookmark
   });
 });
 
-// @desc    Remove bookmark
-// @route   DELETE /api/enrollments/bookmark/:bookmarkId
-// @access  Private
+// =============================================
+// REMOVE BOOKMARK
+// =============================================
 export const removeBookmark = asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.bookmarkId)) {
+    res.status(400);
+    throw new Error('Invalid bookmark ID');
+  }
+
   const enrollment = await Enrollment.findOne({
     student: req.user._id,
     'bookmarks._id': req.params.bookmarkId
@@ -801,13 +1129,17 @@ export const removeBookmark = asyncHandler(async (req, res) => {
   });
 });
 
-// @desc    Save personal notes for a lecture
-// @route   PUT /api/enrollments/notes/:lectureId
-// @access  Private
+// =============================================
+// SAVE LECTURE NOTES
+// =============================================
 export const saveLectureNotes = asyncHandler(async (req, res) => {
-  const { notes } = req.body;
+  if (!isValidId(req.params.lectureId)) {
+    res.status(400);
+    throw new Error('Invalid lecture ID');
+  }
 
-  const lecture = await Lecture.findById(req.params.lectureId);
+  const { notes } = req.body;
+  const lecture = await Lecture.findById(req.params.lectureId).lean();
 
   if (!lecture) {
     res.status(404);
@@ -817,7 +1149,7 @@ export const saveLectureNotes = asyncHandler(async (req, res) => {
   const enrollment = await Enrollment.findOne({
     student: req.user._id,
     course: lecture.course,
-    status: 'active'
+    status: { $in: ['active', 'completed'] }
   });
 
   if (!enrollment) {
@@ -829,6 +1161,8 @@ export const saveLectureNotes = asyncHandler(async (req, res) => {
     p => p.lecture.toString() === lecture._id.toString()
   );
 
+  const safeNotes = String(notes || '').substring(0, 5000);
+
   if (progressIndex === -1) {
     enrollment.lectureProgress.push({
       lecture: lecture._id,
@@ -836,37 +1170,42 @@ export const saveLectureNotes = asyncHandler(async (req, res) => {
       totalWatchTime: 0,
       lastPosition: 0,
       isCompleted: false,
-      personalNotes: notes
+      personalNotes: safeNotes
     });
   } else {
-    enrollment.lectureProgress[progressIndex].personalNotes = notes;
+    enrollment.lectureProgress[progressIndex].personalNotes = safeNotes;
   }
 
   await enrollment.save();
 
   res.json({
     success: true,
-    message: 'Notes saved'
+    message: 'Notes saved successfully'
   });
 });
 
-// @desc    Get code submissions
-// @route   GET /api/enrollments/submissions/:lectureId
-// @access  Private
+// =============================================
+// GET CODE SUBMISSIONS
+// =============================================
 export const getCodeSubmissions = asyncHandler(async (req, res) => {
+  if (!isValidId(req.params.lectureId)) {
+    res.status(400);
+    throw new Error('Invalid lecture ID');
+  }
+
   const enrollment = await Enrollment.findOne({
     student: req.user._id
-  }).populate('codeSubmissions.lecture', 'title');
+  }).populate('codeSubmissions.lecture', 'title').lean();
 
   if (!enrollment) {
     res.status(404);
     throw new Error('No enrollments found');
   }
 
-  const submissions = enrollment.codeSubmissions.filter(
-    s => s.lecture._id.toString() === req.params.lectureId ||
-         s.lecture.toString() === req.params.lectureId
-  );
+  const submissions = enrollment.codeSubmissions.filter(s => {
+    const lectureId = s.lecture?._id || s.lecture;
+    return lectureId?.toString() === req.params.lectureId;
+  });
 
   res.json({
     success: true,
